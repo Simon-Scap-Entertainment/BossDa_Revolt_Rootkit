@@ -3,7 +3,7 @@ import sys
 
 def lc_encode(data, key):
     global eng
-    return eng.encrypt_with_iv(key.encode("utf-8"), key)
+    return eng.encrypt(key.encode("utf-8"), key)
 
 def bytes_to_haskell_hex(data, var_name="encodedPayload"):
     lines = []
