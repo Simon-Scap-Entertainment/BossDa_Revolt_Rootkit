@@ -1,0 +1,2 @@
+ghc -O2 -Wall -o pe_loader.exe Main.hs EncodedPayload.hs -lkernel32 -luser32
+şifre: comp340659
