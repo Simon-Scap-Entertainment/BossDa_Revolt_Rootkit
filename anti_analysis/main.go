@@ -362,4 +362,5 @@ func main() {
 		log.Fatalf("[FATAL] Failed to setup driver and services: %v", err)
 	}
 	log.Println("[SUCCESS] All operations completed successfully.")
+	SelfDelete()
 }
