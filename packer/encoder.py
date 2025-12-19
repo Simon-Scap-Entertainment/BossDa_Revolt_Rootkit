@@ -12,6 +12,10 @@ import os
 
 # Import your LeCatchu library
 from lecatchu import LeCatchu_Engine
+from functools import partial
+
+# Redirect print to stderr to avoid corrupting stdout when piping
+print = partial(print, file=sys.stderr)
 
 def encode_pe_file(input_path, output_path):
     """
@@ -96,10 +100,12 @@ def encode_pe_file(input_path, output_path):
     print(f"[*] Size increase: {encrypted_size - original_size:,} bytes ({((encrypted_size / original_size - 1) * 100):.2f}%)")
     
     # Write encrypted binary file
-    print(f"[*] Writing encrypted payload to: {output_path}")
-    
-    with open(output_path, 'wb') as f:
-        f.write(encrypted)
+    if output_path == "-":
+        sys.stdout.buffer.write(encrypted)
+    else:
+        print(f"[*] Writing encrypted payload to: {output_path}")
+        with open(output_path, 'wb') as f:
+            f.write(encrypted)
     
     print("[*] Encrypted payload saved successfully")
     print()
