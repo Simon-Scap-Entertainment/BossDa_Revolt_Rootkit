@@ -887,19 +887,30 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       vtablePtr <- peek (castPtr pRuntimeHostRaw)
       let vtablePtr' = castPtr vtablePtr :: Ptr ICLRRuntimeHostVTable
 
-      -- [FIXED]: Do not unwrap vtablePtr'. It is already the pointer we need.
-      let vtablePtrRaw = vtablePtr'
-      -- The runtimeHost variable DOES need unwrapping because we wrapped it earlier.
+      -- [FIXED]: Ensure vtablePtrRaw is treated as a pointer to the VTable
+      let vtablePtrRaw = vtablePtr' 
       let (ICLRRuntimeHost runtimeHostRaw) = runtimeHost
 
+      -- 1. Get the Start function pointer from the VTable
+      -- We MUST ensure pStart is looking at the correct 64-bit offset
       pStartFuncPtr <- pStart (castPtr vtablePtrRaw)
-      hrStart <- mkCLRStart pStartFuncPtr (castPtr runtimeHostRaw)
-      when (hrStart < 0) $ do
-        err <- c_GetLastError
-        error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart ++ " (last error: " ++ show err ++ ")"
-      putStrLn "[*] CLR started."
-      hFlush stdout
+      
+      -- CRITICAL: Check if the pointer is null before calling it
+      if pStartFuncPtr == nullFunPtr
+        then error "[-] Critical Error: pStartFuncPtr is NULL. Your VTable offset is likely wrong for x64."
+        else putStrLn $ "[*] Start function pointer located at: " ++ show pStartFuncPtr
 
+      -- 2. Call the Start method
+      -- The first argument (the 'this' pointer) is mandatory in COM
+      hrStart <- mkCLRStart pStartFuncPtr (castPtr runtimeHostRaw)
+      
+      if hrStart < 0 
+        then do
+          err <- c_GetLastError
+          error $ "ICLRRuntimeHost::Start failed with HRESULT: " ++ show hrStart ++ " (Last Error: " ++ show err ++ ")"
+        else do
+          putStrLn "[*] CLR started successfully."
+          hFlush stdout
       alloca $ \ppvDomain -> do
         pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtrRaw)
         hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr (castPtr runtimeHostRaw) ppvDomain
