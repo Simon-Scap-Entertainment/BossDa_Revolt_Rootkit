@@ -893,81 +893,43 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
   comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
   comDirData <- peek comDir
- 
+  
   if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
-      putStrLn "[*] Detected .NET assembly. Attempting to load CLR."
+      putStrLn "[*] Detected .NET assembly. Attempting to execute."
       hFlush stdout
 
-      -- Initialize COM with proper error handling
-      hrCom <- c_CoInitializeEx nullPtr 0
-      when (hrCom < 0 && hrCom /= (-2147417850)) $  -- S_FALSE = already initialized
-        error $ "[-] COM initialization failed: HRESULT = 0x" ++ showHex (fromIntegral hrCom :: Word32) ""
-      putStrLn "[*] COM initialized."
+      -- CRITICAL: Set up the PE headers that _CorExeMain expects
+      -- _CorExeMain needs to find the DOS and NT headers
+      putStrLn "[*] Setting up PE environment for CLR..."
       hFlush stdout
       
-      maybeHost <- getCLRRuntimeHost
-      case maybeHost of
-        Nothing -> error "[-] Critical Error: Failed to obtain ICLRRuntimeHost interface."
-        Just hostPtr -> do
-          -- Validate the host pointer
-          when (hostPtr == nullPtr) $
-            error "[-] ICLRRuntimeHost pointer is NULL"
-          
-          putStrLn $ "[*] ICLRRuntimeHost interface at: 0x" ++ showHex (ptrToWordPtr hostPtr) ""
+      -- Get the DOS header and verify
+      let dosHeaderInMem = castPtr imageBasePtr :: Ptr ImageDosHeader
+      dosHdr <- peek dosHeaderInMem
+      putStrLn $ "[*] DOS signature in memory: 0x" ++ showHex (dos_e_magic dosHdr) ""
+      
+      -- Get NT headers
+      let ntOffset = fromIntegral (dos_e_lfanew dosHdr)
+      let ntHeadersPtr = plusPtr imageBasePtr ntOffset :: Ptr ImageNtHeaders64
+      ntHdrs <- peek ntHeadersPtr
+      putStrLn $ "[*] NT signature in memory: 0x" ++ showHex (nt_signature ntHdrs) ""
+      hFlush stdout
+      
+      -- Try calling _CorExeMain directly - it should bootstrap the CLR
+      putStrLn "[*] Calling _CorExeMain (CLR will auto-initialize)..."
+      hFlush stdout
+      
+      result <- try (c_CorExeMain imageBase) :: IO (Either SomeException Int32)
+      case result of
+        Left ex -> do
+          putStrLn $ "[!] _CorExeMain threw exception: " ++ show ex
+          putStrLn "[*] Attempting manual CLR initialization..."
           hFlush stdout
-          
-          -- Dereference to get the VTable
-          vtablePtr <- peek (castPtr hostPtr :: Ptr (Ptr (Ptr ())))
-          putStrLn $ "[*] VTable address: 0x" ++ showHex (ptrToWordPtr vtablePtr) ""
+          manualCLRInit imageBase imageBasePtr
+        Right exitCode -> do
+          putStrLn $ "[+] _CorExeMain returned with exit code: " ++ show exitCode
           hFlush stdout
-          
-          -- Get the Start method function pointer (index 3 in VTable)
-          pStartRaw <- peekElemOff vtablePtr 3
-          let pStartFunc = castPtrToFunPtr pStartRaw :: FunPtr (Ptr () -> IO HRESULT)
-          
-          -- Call Start method - IMPORTANT: Pass hostPtr (the interface pointer), not vtablePtr
-          putStrLn "[*] Calling ICLRRuntimeHost::Start()..."
-          hFlush stdout
-          hrStart <- mkCLRStart pStartFunc hostPtr
-          
-          if hrStart < 0 
-            then error $ "[-] CLR Start failed: HRESULT = 0x" ++ showHex (fromIntegral hrStart :: Word32) ""
-            else putStrLn "[+] CLR started successfully."
-          hFlush stdout
-          
-          -- Get default AppDomain
-          alloca $ \ppvDomain -> do
-            -- Get GetDefaultDomain method (index 13 in VTable)
-            pGetDomainRaw <- peekElemOff vtablePtr 13
-            let pGetDomainFunc = castPtrToFunPtr pGetDomainRaw :: FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
-            
-            putStrLn "[*] Calling ICLRRuntimeHost::GetDefaultDomain()..."
-            hFlush stdout
-            hrDomain <- mkCLRGetDefaultDomain pGetDomainFunc hostPtr ppvDomain
-            
-            if hrDomain < 0
-              then error $ "[-] GetDefaultDomain failed: HRESULT = 0x" ++ showHex (fromIntegral hrDomain :: Word32) ""
-              else putStrLn "[+] Successfully obtained default AppDomain."
-            hFlush stdout
-            
-            pAppDomain <- peek ppvDomain
-            when (pAppDomain == nullPtr) $
-              error "[-] AppDomain pointer is NULL"
-            
-            putStrLn $ "[*] AppDomain interface at: 0x" ++ showHex (ptrToWordPtr pAppDomain) ""
-            hFlush stdout
-            
-            -- Call _CorExeMain to execute the .NET assembly
-            putStrLn "[*] Calling _CorExeMain()..."
-            hFlush stdout
-            exitCode <- c_CorExeMain imageBase
-            putStrLn $ "[*] _CorExeMain returned with exit code: " ++ show exitCode
-            hFlush stdout
-            
-            -- Cleanup (optional, but good practice)
-            putStrLn "[*] .NET assembly execution completed."
-            hFlush stdout
     else do
       -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
@@ -989,7 +951,50 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
           let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
           _ <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
           return ()
+
+manualCLRInit :: Ptr () -> Ptr Word8 -> IO ()
+manualCLRInit imageBase imageBasePtr = do
+  -- Initialize COM
+  hrCom <- c_CoInitializeEx nullPtr 0
+  when (hrCom < 0 && hrCom /= (-2147417850)) $ do
+    putStrLn $ "[-] COM initialization failed: HRESULT = 0x" ++ showHex (fromIntegral hrCom :: Word32) ""
+    hFlush stdout
+  putStrLn "[*] COM initialized."
+  hFlush stdout
   
+  maybeHost <- getCLRRuntimeHost
+  case maybeHost of
+    Nothing -> do
+      putStrLn "[-] Could not obtain ICLRRuntimeHost."
+      putStrLn "[-] The .NET assembly cannot execute without CLR host."
+      hFlush stdout
+    Just hostPtr -> do
+      putStrLn $ "[*] Got CLR host at: 0x" ++ showHex (ptrToWordPtr hostPtr) ""
+      hFlush stdout
+      
+      -- Get VTable
+      vtablePtr <- peek (castPtr hostPtr :: Ptr (Ptr (Ptr ())))
+      
+      -- Get Start function
+      pStartRaw <- peekElemOff vtablePtr 3
+      let pStartFunc = castPtrToFunPtr pStartRaw :: FunPtr (Ptr () -> IO HRESULT)
+      
+      putStrLn "[*] Starting CLR..."
+      hFlush stdout
+      hrStart <- mkCLRStart pStartFunc hostPtr
+      
+      if hrStart < 0 
+        then putStrLn $ "[-] CLR Start failed: HRESULT = 0x" ++ showHex (fromIntegral hrStart :: Word32) ""
+        else putStrLn "[+] CLR started."
+      hFlush stdout
+      
+      -- Retry _CorExeMain
+      putStrLn "[*] Retrying _CorExeMain..."
+      hFlush stdout
+      exitCode <- c_CorExeMain imageBase
+      putStrLn $ "[*] _CorExeMain returned: " ++ show exitCode
+      hFlush stdout
+
 -- ============================================
 -- MAIN
 -- ============================================
