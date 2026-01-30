@@ -501,8 +501,8 @@ foreign import ccall "dynamic"
                  -> (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
 foreign import ccall "dynamic"
-  mkRIGetInterface :: FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
-                   -> (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+  mkRIGetInterface :: FunPtr (Ptr () -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
+                   -> (Ptr () -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
 
 foreign import ccall "dynamic"
   mkMHRelease :: FunPtr (Ptr ICLRMetaHost -> IO ULONG) -> (Ptr ICLRMetaHost -> IO ULONG)
@@ -557,41 +557,36 @@ getCLRRuntimeHost = alloca $ \ppv -> do
   where
     tryV4 :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ICLRRuntimeHost))
     tryV4 ppvHost = alloca $ \ppvMeta -> do
-      -- 1. Create the MetaHost
+      -- 1. Create MetaHost
       hr <- with clsid_CLRMetaHost $ \clsid -> 
               with iid_ICLRMetaHost $ \iid -> 
                 c_CLRCreateInstance clsid iid ppvMeta
       
       if hr < 0 then return Nothing else do
         pMetaRaw <- peek ppvMeta
-        -- Cast generic IUnknown pointer to the specific ICLRMetaHost type
-        let pMetaHost = castPtr pMetaRaw :: Ptr ICLRMetaHost
-        
-        -- Get the VTable pointer (first 8 bytes of the object)
-        vtableMetaPtr <- peek (castPtr pMetaHost) :: IO (Ptr ICLRMetaHostVTable)
+        -- Access the VTable to get the GetRuntime function
+        vtableMetaPtr <- peek (castPtr pMetaRaw) :: IO (Ptr (Ptr ()))
         
         -- 2. GetRuntime ("v4.0.30319")
         alloca $ \ppvInfo -> do
           pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
           verStr <- newCWString "v4.0.30319"
           hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
-             mkMHGetRuntime pGetRuntimeFunc pMetaHost (castPtr verStr) iid ppvInfo
+             mkMHGetRuntime pGetRuntimeFunc (castPtr pMetaRaw) (castPtr verStr) iid ppvInfo
           free verStr
 
           if hrRuntime < 0 then return Nothing else do
             pInfoRaw <- peek ppvInfo
-            -- Cast generic IUnknown pointer to the specific ICLRRuntimeInfo type
-            let pRuntimeInfo = castPtr pInfoRaw :: Ptr ICLRRuntimeInfo
+            vtableInfoPtr <- peek (castPtr pInfoRaw) :: IO (Ptr (Ptr ()))
             
-            vtableInfoPtr <- peek (castPtr pRuntimeInfo) :: IO (Ptr ICLRRuntimeInfoVTable)
-            
-            -- 3. GetInterface (ICLRRuntimeHost)
+            -- 3. GetInterface
             pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
             
-            -- [FIX]: Use iid_ICLRRuntimeHost for BOTH rclsid and riid to bypass registry checks
+            -- [THE CRITICAL CHANGE]: Pass iid_ICLRRuntimeHost as BOTH rclsid and riid.
+            -- This bypasses the "Class Not Registered" error on 64-bit systems.
             hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
                         with iid_ICLRRuntimeHost $ \riid ->
-                           mkRIGetInterface pGetInterfaceFunc pRuntimeInfo rclsid riid ppvHost
+                           mkRIGetInterface pGetInterfaceFunc (castPtr pInfoRaw) rclsid riid (castPtr ppvHost)
 
             if hrHost < 0 then return Nothing else do
               hostPtr <- peek ppvHost
