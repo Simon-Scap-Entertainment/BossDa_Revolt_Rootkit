@@ -827,8 +827,6 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
   comDirData <- peek comDir
  
-  -- START CONDITIONAL LOADING
-  -- [FIXED SECTION] Starting at Line 835
   if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
       putStrLn "[*] Detected .NET assembly. Attempting to load CLR."
@@ -837,34 +835,38 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       _ <- c_CoInitializeEx nullPtr 0 
       putStrLn "[*] COM initialized."
       
-      -- Step 1: Unwrap the Host Pointer
+      -- 1. Get the Maybe wrapper
       maybeHost <- getCLRRuntimeHost
       case maybeHost of
         Nothing -> error "[-] Critical Error: ICLRRuntimeHost instance is NULL."
         Just pRuntimeHostRaw -> do
-          let runtimeHostRaw = castPtr pRuntimeHostRaw
+          -- 1. This is the Instance Pointer (RCX)
+          let instancePtr = castPtr pRuntimeHostRaw 
           
-          -- Step 2: Dereference VTable ONLY if we have a valid pointer
-          vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
-          if vtablePtr == nullPtr
-            then error "[-] VTable dereference failed!"
+          -- 2. DEREFERENCE to get the actual VTable address
+          -- This is the step your current code is missing!
+          vtableAddr <- peek (castPtr instancePtr) :: IO (Ptr (Ptr ()))
+          
+          if vtableAddr == nullPtr
+            then error "[-] VTable pointer is NULL!"
             else do
-              -- Step 3: Locate and Call Start
-              pStartFuncPtr <- pStart (castPtr vtablePtr)
+              -- 3. Get 'Start' (Index 3) from the VTable array
+              pStartFuncPtr <- peekElemOff vtableAddr 3
+
               if pStartFuncPtr == nullFunPtr
                 then error "[-] Critical Error: pStartFuncPtr is NULL."
                 else do
+                  putStrLn "[*] Calling ICLRRuntimeHost::Start..."
                   hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
+                  
                   if hrStart < 0 
-                    then error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart
+                    then error $ "CLR Start failed: " ++ show hrStart
                     else putStrLn "[*] CLR started successfully."
 
-              -- Step 4: AppDomain Logic
+              -- 5. AppDomain Logic (Must stay inside 'Just' block)
               alloca $ \ppvDomain -> do
                 pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
-                hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
-                
-                when (hrGetDomain < 0) $ error "Failed to get AppDomain"
+                _ <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
                 
                 pAppDomainIUnknown <- peek ppvDomain
                 let appDomainRaw = castPtr pAppDomainIUnknown
@@ -872,7 +874,6 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
                 appBasePath <- newCWString "C:\\"
                 bstrAppBase <- c_SysAllocString (castPtr appBasePath)
-                
                 pPutAppBaseFunc <- pPutApplicationBase (castPtr domainVtablePtr)
                 _ <- mkADPutApplicationBase pPutAppBaseFunc (castPtr appDomainRaw) bstrAppBase
                 
@@ -882,13 +883,14 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
                 
                 c_SysFreeString bstrAppBase
                 free appBasePath
-                return () -- End of AppDomain do-block
+                return ()
 
-              -- Cleanup
-              pStopFuncPtr <- pStop (castPtr vtablePtr)
-              _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
-              c_CoUninitialize
-              return () -- End of Just branch
+          -- 6. Cleanup (Must stay inside 'Just' block)
+          pStopFuncPtr <- pStop (castPtr (vtablePtr :: Ptr (Ptr ())))
+          _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
+          c_CoUninitialize
+          return () -- This closes the 'Just' arm
+
     else do
       -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
