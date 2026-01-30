@@ -840,21 +840,21 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       case maybeHost of
         Nothing -> error "[-] Critical Error: ICLRRuntimeHost instance is NULL."
         Just pRuntimeHostRaw -> do
-          -- 1. This is the Instance Pointer (RCX)
-          let instancePtr = castPtr pRuntimeHostRaw 
+          -- 1. runtimeHostRaw is now in scope for the rest of this 'do' block
+          let runtimeHostRaw = castPtr pRuntimeHostRaw
           
-          -- 2. DEREFERENCE to get the actual VTable address
-          -- This is the step your current code is missing!
-          vtableAddr <- peek (castPtr instancePtr) :: IO (Ptr (Ptr ()))
+          -- 2. DEREFERENCE the instance to get the VTable address
+          -- This fixes the Access Violation at 0x0
+          vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
           
-          if vtableAddr == nullPtr
-            then error "[-] VTable pointer is NULL!"
+          if vtablePtr == nullPtr
+            then error "[-] VTable dereference failed!"
             else do
-              -- 3. Get 'Start' (Index 3) from the VTable array
-              pStartFuncPtr <- peekElemOff vtableAddr 3
-
+              -- 3. Get 'Start' (Index 3)
+              pStartFuncPtr <- peekElemOff (castPtr vtablePtr) 3
+              
               if pStartFuncPtr == nullFunPtr
-                then error "[-] Critical Error: pStartFuncPtr is NULL."
+                then error "[-] pStartFuncPtr is NULL."
                 else do
                   putStrLn "[*] Calling ICLRRuntimeHost::Start..."
                   hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
@@ -863,10 +863,12 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
                     then error $ "CLR Start failed: " ++ show hrStart
                     else putStrLn "[*] CLR started successfully."
 
-              -- 5. AppDomain Logic (Must stay inside 'Just' block)
+              -- 4. Get AppDomain (Uses vtablePtr and runtimeHostRaw which are in scope)
               alloca $ \ppvDomain -> do
                 pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
-                _ <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
+                hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
+                
+                when (hrGetDomain < 0) $ error "Failed to get AppDomain"
                 
                 pAppDomainIUnknown <- peek ppvDomain
                 let appDomainRaw = castPtr pAppDomainIUnknown
@@ -884,13 +886,6 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
                 c_SysFreeString bstrAppBase
                 free appBasePath
                 return ()
-
-          -- 6. Cleanup (Must stay inside 'Just' block)
-          pStopFuncPtr <- pStop (castPtr (vtablePtr :: Ptr (Ptr ())))
-          _ <- mkCLRStop pStopFuncPtr runtimeHostRaw
-          c_CoUninitialize
-          return () -- This closes the 'Just' arm
-
     else do
       -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
