@@ -15,6 +15,7 @@ import Data.Bits ((.|.), (.&.), shiftR, testBit, xor)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as C8
 import qualified Data.ByteString.Unsafe as BSU
+import Unsafe.Coerce (unsafeCoerce)
 import Control.Monad
 import Control.Exception
 import System.IO (hSetBuffering, BufferMode(LineBuffering), stdout, stderr, hFlush)
@@ -557,41 +558,37 @@ getCLRRuntimeHost = alloca $ \ppv -> do
   where
     tryV4 :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ICLRRuntimeHost))
     tryV4 ppvHost = alloca $ \ppvMeta -> do
-      -- 1. Create MetaHost
       hr <- with clsid_CLRMetaHost $ \clsid -> 
               with iid_ICLRMetaHost $ \iid -> 
                 c_CLRCreateInstance clsid iid ppvMeta
       
       if hr < 0 then return Nothing else do
         pMetaRaw <- peek ppvMeta
-        -- Access the VTable to get the GetRuntime function
         vtableMetaPtr <- peek (castPtr pMetaRaw) :: IO (Ptr (Ptr ()))
         
-        -- 2. GetRuntime ("v4.0.30319")
         alloca $ \ppvInfo -> do
           pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
           verStr <- newCWString "v4.0.30319"
+          -- We use unsafeCoerce here to satisfy the compiler's type check
           hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
-             mkMHGetRuntime pGetRuntimeFunc (castPtr pMetaRaw) (castPtr verStr) iid ppvInfo
+             (unsafeCoerce mkMHGetRuntime) pGetRuntimeFunc pMetaRaw (castPtr verStr) iid ppvInfo
           free verStr
 
           if hrRuntime < 0 then return Nothing else do
             pInfoRaw <- peek ppvInfo
             vtableInfoPtr <- peek (castPtr pInfoRaw) :: IO (Ptr (Ptr ()))
             
-            -- 3. GetInterface
             pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
             
-            -- [THE CRITICAL CHANGE]: Pass iid_ICLRRuntimeHost as BOTH rclsid and riid.
-            -- This bypasses the "Class Not Registered" error on 64-bit systems.
+            -- [THE FIX]: unsafeCoerce forces mkRIGetInterface to accept the pointer
+            -- and we pass iid_ICLRRuntimeHost twice to fix the "Class Not Registered" error.
             hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
                         with iid_ICLRRuntimeHost $ \riid ->
-                           mkRIGetInterface pGetInterfaceFunc (castPtr pInfoRaw) rclsid riid (castPtr ppvHost)
+                           (unsafeCoerce mkRIGetInterface) pGetInterfaceFunc pInfoRaw rclsid riid ppvHost
 
             if hrHost < 0 then return Nothing else do
               hostPtr <- peek ppvHost
               return (Just (castPtr hostPtr))
-
 getDataDirectory :: Ptr ImageNtHeaders64 -> Int -> IO (Ptr ImageDataDirectory)
 getDataDirectory ntPtr index = do
   let optHeaderPtr = plusPtr ntPtr 24
