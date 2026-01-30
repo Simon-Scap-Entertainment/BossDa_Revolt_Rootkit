@@ -75,7 +75,7 @@ if exist "Main.hi" del /Q Main.hi
 if exist "Base45.o" del /Q Base45.o
 if exist "Base45.hi" del /Q Base45.hi
 
-ghc -O2 Main.hs Base45.hs -package bytestring -L"C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8.1\Lib\um\x64" -lmscoree +RTS -K256M -RTS -o %LOADER_EXE_NAME%
+ghc -O2 Main.hs Base45.hs -package bytestring -package file-embed -L"C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8.1\Lib\um\x64" -lmscoree -lole32 -loleaut32 -luser32 -lkernel32 +RTS -K256M -RTS -o %LOADER_EXE_NAME%
 
 if errorlevel 1 (
     echo [!] Haskell loader build failed

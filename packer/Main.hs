@@ -364,19 +364,28 @@ instance Storable ImageTlsDirectory64 where
 -- COM INTERFACES FOR CLR HOSTING
 -- ============================================
 
--- ICLRRuntimeHost GUID
-clsid_CLRRuntimeHost :: GUID
-clsid_CLRRuntimeHost = GUID 0x90F1A06E 0x7712 0x4762 0x86B5 0x7A5EBA6BDB02
-
+-- ICLRRuntimeHost (The interface we actually want to use)
 iid_ICLRRuntimeHost :: GUID
-iid_ICLRRuntimeHost = GUID 0x90F1A06E 0x7712 0x4762 0x86B5 0x7A5EBA6BDB02
+iid_ICLRRuntimeHost = GUID 0x90F1A06C 0x7712 0x4762 [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02]
+
+-- CLRRuntimeHost (The class ID for v4+)
+clsid_CLRRuntimeHost :: GUID
+clsid_CLRRuntimeHost = GUID 0x9280188D 0x0E8E 0x4867 [0xB3, 0x0C, 0x7F, 0xA8, 0x38, 0x84, 0xE8, 0xDE]
+
+-- CorRuntimeHost (The legacy class ID for v2 and Shims)
+clsid_CorRuntimeHost :: GUID
+clsid_CorRuntimeHost = GUID 0xCB2F6723 0xAB3A 0x11D2 [0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E]
 
 -- ICLRRuntimeHost interface
 newtype ICLRRuntimeHost = ICLRRuntimeHost (Ptr ())
 newtype ICLRRuntimeHostVTable = ICLRRuntimeHostVTable (Ptr ICLRRuntimeHostVTable)
 
+-- Use this for BOTH clsid_CLRRuntimeHost AND iid_ICLRRuntimeHost
+-- in the context of the v4 GetInterface call.
+guid_ICLRRuntimeHost :: GUID
+guid_ICLRRuntimeHost = GUID 0x90F1A06C 0x7712 0x4762 [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02]
+
 -- Dynamic Wrappers for VTable Methods
--- We need these to call the FunPtrs returned by peeking the VTable
 foreign import ccall "dynamic"
   mkCLRQueryInterface :: FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
                       -> (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
@@ -401,7 +410,7 @@ foreign import ccall "dynamic"
   mkCLRGetDefaultDomain :: FunPtr (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT)
                         -> (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
--- Accessors for ICLRRuntimeHostVTable methods (Offset calculation)
+-- Accessors for ICLRRuntimeHostVTable methods
 pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
 pQueryInterface ptr = peek (castPtr ptr `plusPtr` (0 * sizeOf (undefined :: FunPtr ())))
 
@@ -414,19 +423,18 @@ pRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ()))
 pStart :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT))
 pStart ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
 
-pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO ULONG))
+-- Corrected pStop type: Stop returns HRESULT (Int32)
+pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT))
 pStop ptr = peek (castPtr ptr `plusPtr` (4 * sizeOf (undefined :: FunPtr ())))
 
 pGetDefaultDomain :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT))
 pGetDefaultDomain ptr = peek (castPtr ptr `plusPtr` (13 * sizeOf (undefined :: FunPtr ()))) 
--- NOTE: GetDefaultDomain is index 13 in standard ICLRRuntimeHost vtable
 
 -- AppDomain GUID
 iid_AppDomain :: GUID
-iid_AppDomain = GUID 0x05F696DC 0x2B29 0x3663 0xAD8B 0xC4389CF2D73A
+iid_AppDomain = GUID 0x05F696DC 0x2B29 0x3663 [0xAD, 0x8B, 0xC4, 0x38, 0x9C, 0xF2, 0xD7, 0x3A]
 
 -- AppDomain interface
--- FIX: Renamed from _AppDomain to AppDomain to comply with Haskell constructor rules
 newtype AppDomain = AppDomain (Ptr ())
 newtype AppDomainVTable = AppDomainVTable (Ptr AppDomainVTable)
 
@@ -449,7 +457,6 @@ pAddRef_AD ptr = peek (castPtr ptr `plusPtr` (1 * sizeOf (undefined :: FunPtr ()
 pRelease_AD :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> IO ULONG))
 pRelease_AD ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
 
--- put_ApplicationBase is often further down in AppDomain
 pPutApplicationBase :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> BSTR -> IO HRESULT))
 pPutApplicationBase ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
 
@@ -464,8 +471,131 @@ foreign import ccall "oleaut32.h SysFreeString"
   c_SysFreeString :: BSTR -> IO ()
 
 -- ============================================
+-- .NET 4.0+ HOSTING FFI (ICLRMetaHost)
+-- ============================================
+
+foreign import ccall "mscoree.h CLRCreateInstance"
+  c_CLRCreateInstance :: Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT
+
+-- GUIDs for .NET 4 Hosting
+clsid_CLRMetaHost :: GUID
+clsid_CLRMetaHost = GUID 0x9280188D 0x0E8E 0x4867 [0xB3, 0x0C, 0x7F, 0xA8, 0x38, 0x84, 0xE8, 0xDE]
+
+iid_ICLRMetaHost :: GUID
+iid_ICLRMetaHost = GUID 0xD332DB9E 0xB9B3 0x4125 [0x82, 0x07, 0xA1, 0x48, 0x84, 0xF5, 0x32, 0x16]
+
+iid_ICLRRuntimeInfo :: GUID
+iid_ICLRRuntimeInfo = GUID 0xBD39D1D2 0xBA2F 0x486a [0x89, 0xB0, 0xB4, 0xB0, 0xCB, 0x46, 0x68, 0x91]
+
+-- ICLRMetaHost Interface
+newtype ICLRMetaHost = ICLRMetaHost (Ptr ())
+newtype ICLRMetaHostVTable = ICLRMetaHostVTable (Ptr ICLRMetaHostVTable)
+
+-- ICLRRuntimeInfo Interface
+newtype ICLRRuntimeInfo = ICLRRuntimeInfo (Ptr ())
+newtype ICLRRuntimeInfoVTable = ICLRRuntimeInfoVTable (Ptr ICLRRuntimeInfoVTable)
+
+-- Dynamic Wrappers
+foreign import ccall "dynamic"
+  mkMHGetRuntime :: FunPtr (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+                 -> (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+
+foreign import ccall "dynamic"
+  mkRIGetInterface :: FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+                   -> (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+
+foreign import ccall "dynamic"
+  mkMHRelease :: FunPtr (Ptr ICLRMetaHost -> IO ULONG) -> (Ptr ICLRMetaHost -> IO ULONG)
+
+foreign import ccall "dynamic"
+  mkRIRelease :: FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG) -> (Ptr ICLRRuntimeInfo -> IO ULONG)
+
+-- VTable Accessors
+pGetRuntime :: Ptr ICLRMetaHostVTable -> IO (FunPtr (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
+pGetRuntime ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
+
+pMHRelease :: Ptr ICLRMetaHostVTable -> IO (FunPtr (Ptr ICLRMetaHost -> IO ULONG))
+pMHRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
+
+pGetInterface :: Ptr ICLRRuntimeInfoVTable -> IO (FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
+pGetInterface ptr = peek (castPtr ptr `plusPtr` (9 * sizeOf (undefined :: FunPtr ())))
+
+pRIRelease :: Ptr ICLRRuntimeInfoVTable -> IO (FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG))
+pRIRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
+
+
+-- ============================================
 -- HELPER FUNCTIONS
 -- ============================================
+
+-- | Helper to get ICLRRuntimeHost either via .NET 4 API or legacy COM
+getCLRRuntimeHost :: IO (Ptr ICLRRuntimeHost)
+getCLRRuntimeHost = alloca $ \ppv -> do
+  -- Try .NET 4 path (CLRCreateInstance)
+  putStrLn "[*] Trying CLRCreateInstance (v4.0)..."
+  hFlush stdout
+  resultV4 <- tryV4 ppv
+  case resultV4 of
+    Just ptr -> return ptr
+    Nothing -> do
+      -- Fallback to .NET 2 path (CoCreateInstance)
+      putStrLn "[!] CLR v4 load failed. Falling back to CoCreateInstance (v2.0)..."
+      hFlush stdout
+      
+      -- CoInit is handled in caller, assuming COM is init
+      -- [FIX]: Use clsid_CorRuntimeHost (the shim) instead of clsid_CLRRuntimeHost
+      with clsid_CorRuntimeHost $ \pClsid ->
+        with iid_ICLRRuntimeHost $ \pIid -> do
+          hr' <- c_CoCreateInstance pClsid nullPtr 1 pIid ppv
+          when (hr' < 0) $ do
+             err <- c_GetLastError
+             error $ "Legacy CLR load failed: " ++ show hr' ++ " (Error: " ++ show err ++ ")"
+          
+          rawPtr <- peek ppv
+          return (castPtr rawPtr)
+
+  where
+    tryV4 :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ICLRRuntimeHost))
+    tryV4 ppvHost = alloca $ \ppvMeta -> do
+      -- 1. Create the MetaHost
+      hr <- with clsid_CLRMetaHost $ \clsid -> 
+              with iid_ICLRMetaHost $ \iid -> 
+                c_CLRCreateInstance clsid iid ppvMeta
+      
+      if hr < 0 then return Nothing else do
+        pMetaRaw <- peek ppvMeta
+        -- Cast generic IUnknown pointer to the specific ICLRMetaHost type
+        let pMetaHost = castPtr pMetaRaw :: Ptr ICLRMetaHost
+        
+        -- Get the VTable pointer (first 8 bytes of the object)
+        vtableMetaPtr <- peek (castPtr pMetaHost) :: IO (Ptr ICLRMetaHostVTable)
+        
+        -- 2. GetRuntime ("v4.0.30319")
+        alloca $ \ppvInfo -> do
+          pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
+          verStr <- newCWString "v4.0.30319"
+          hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
+             mkMHGetRuntime pGetRuntimeFunc pMetaHost (castPtr verStr) iid ppvInfo
+          free verStr
+
+          if hrRuntime < 0 then return Nothing else do
+            pInfoRaw <- peek ppvInfo
+            -- Cast generic IUnknown pointer to the specific ICLRRuntimeInfo type
+            let pRuntimeInfo = castPtr pInfoRaw :: Ptr ICLRRuntimeInfo
+            
+            vtableInfoPtr <- peek (castPtr pRuntimeInfo) :: IO (Ptr ICLRRuntimeInfoVTable)
+            
+            -- 3. GetInterface (ICLRRuntimeHost)
+            pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
+            
+            -- [FIX]: Use iid_ICLRRuntimeHost for BOTH rclsid and riid to bypass registry checks
+            hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
+                        with iid_ICLRRuntimeHost $ \riid ->
+                           mkRIGetInterface pGetInterfaceFunc pRuntimeInfo rclsid riid ppvHost
+
+            if hrHost < 0 then return Nothing else do
+              hostPtr <- peek ppvHost
+              return (Just (castPtr hostPtr))
 
 getDataDirectory :: Ptr ImageNtHeaders64 -> Int -> IO (Ptr ImageDataDirectory)
 getDataDirectory ntPtr index = do
@@ -745,110 +875,101 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
 
       -- Initialize COM
       hr <- c_CoInitializeEx nullPtr 0 -- COINIT_APARTMENTTHREADED
-      when (hr < 0) $ do
+      
+      -- RPC_E_CHANGED_MODE (0x80010106) means COM is already init in a different mode.
+      -- This is generally harmless for our purposes.
+      when (hr < 0 && hr /= -2147417850) $ do
         err <- c_GetLastError
-        error $ "CoInitializeEx failed: " ++ show hr ++ " (last error: " ++ show err ++ ")"
+        putStrLn $ "[!] CoInitializeEx warning: " ++ show hr ++ " (last error: " ++ show err ++ ")"
+      
       putStrLn "[*] COM initialized."
       hFlush stdout
 
-      alloca $ \ppv -> do
-        -- ppv is Ptr (Ptr IUnknown), matching what CoCreateInstance wants for the last arg
-        with clsid_CLRRuntimeHost $ \pClsid ->
-          with iid_ICLRRuntimeHost $ \pIid -> do
-            hr' <- c_CoCreateInstance pClsid nullPtr 1 -- CLSCTX_INPROC_SERVER
-                           pIid ppv
-            when (hr' < 0) $ do
-              err <- c_GetLastError
-              error $ "CoCreateInstance(ICLRRuntimeHost) failed: " ++ show hr' ++ " (last error: " ++ show err ++ ")"
-            putStrLn "[*] ICLRRuntimeHost instance created."
-            hFlush stdout
+      -- ACQUIRE RUNTIME HOST (UPDATED: Dual Support v4/v2)
+      pRuntimeHostRaw <- getCLRRuntimeHost
+      let runtimeHost = ICLRRuntimeHost (castPtr pRuntimeHostRaw)
+      
+      putStrLn "[*] ICLRRuntimeHost instance created."
+      hFlush stdout
 
-            -- Cast the generic interface pointer to our runtime host type
-            pRuntimeHostIUnknown <- peek ppv
-            let pRuntimeHost = castPtr pRuntimeHostIUnknown :: Ptr ICLRRuntimeHost
-            let runtimeHost = ICLRRuntimeHost pRuntimeHost
-            
-            -- Get VTable
-            vtablePtr <- peek (castPtr pRuntimeHost)
-            let vtablePtr' = castPtr vtablePtr :: Ptr ICLRRuntimeHostVTable
+      vtablePtr <- peek (castPtr pRuntimeHostRaw)
+      let vtablePtr' = castPtr vtablePtr :: Ptr ICLRRuntimeHostVTable
 
-            -- Start the CLR
-            pStartFuncPtr <- pStart vtablePtr'
-            -- Use the dynamic wrapper to call the function pointer
-            hrStart <- mkCLRStart pStartFuncPtr pRuntimeHost
-            when (hrStart < 0) $ do
-              err <- c_GetLastError
-              error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart ++ " (last error: " ++ show err ++ ")"
-            putStrLn "[*] CLR started."
-            hFlush stdout
+      -- [FIXED]: Do not unwrap vtablePtr'. It is already the pointer we need.
+      let vtablePtrRaw = vtablePtr'
+      -- The runtimeHost variable DOES need unwrapping because we wrapped it earlier.
+      let (ICLRRuntimeHost runtimeHostRaw) = runtimeHost
 
-            -- Get default AppDomain
-            alloca $ \ppvDomain -> do
-              -- Get the function pointer
-              pGetDefaultDomainFuncPtr <- pGetDefaultDomain vtablePtr'
-              -- Call it using dynamic wrapper
-              hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr pRuntimeHost ppvDomain
-              
-              when (hrGetDomain < 0) $ do
-                err <- c_GetLastError
-                error $ "ICLRRuntimeHost::GetDefaultDomain failed: " ++ show hrGetDomain ++ " (last error: " ++ show err ++ ")"
-              putStrLn "[*] Default AppDomain obtained."
-              hFlush stdout
+      pStartFuncPtr <- pStart (castPtr vtablePtrRaw)
+      hrStart <- mkCLRStart pStartFuncPtr (castPtr runtimeHostRaw)
+      when (hrStart < 0) $ do
+        err <- c_GetLastError
+        error $ "ICLRRuntimeHost::Start failed: " ++ show hrStart ++ " (last error: " ++ show err ++ ")"
+      putStrLn "[*] CLR started."
+      hFlush stdout
 
-              pAppDomainIUnknown <- peek ppvDomain
-              let pAppDomain = castPtr pAppDomainIUnknown :: Ptr AppDomain
-              let appDomain = AppDomain pAppDomain
-              
-              domainVtablePtr <- peek (castPtr pAppDomain)
-              let domainVtablePtr' = castPtr domainVtablePtr :: Ptr AppDomainVTable
+      alloca $ \ppvDomain -> do
+        pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtrRaw)
+        hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr (castPtr runtimeHostRaw) ppvDomain
+        
+        when (hrGetDomain < 0) $ do
+          err <- c_GetLastError
+          error $ "ICLRRuntimeHost::GetDefaultDomain failed: " ++ show hrGetDomain ++ " (last error: " ++ show err ++ ")"
+        putStrLn "[*] Default AppDomain obtained."
+        hFlush stdout
+  
+        pAppDomainIUnknown <- peek ppvDomain
+        let pAppDomain = castPtr pAppDomainIUnknown :: Ptr AppDomain
+        let appDomain = AppDomain (castPtr pAppDomain)
+        
+        domainVtablePtr <- peek (castPtr pAppDomain)
+        let domainVtablePtr' = castPtr domainVtablePtr :: Ptr AppDomainVTable
 
-              -- Set ApplicationBase (dummy path)
-              appBasePath <- newCWString "C:\\"
-              bstrAppBase <- c_SysAllocString appBasePath
-              freeCWString appBasePath
+        -- [FIXED]: Do not unwrap domainVtablePtr'. It is already the pointer we need.
+        let domainVtablePtrRaw = domainVtablePtr'
+        -- The appDomain variable DOES need unwrapping.
+        let (AppDomain appDomainRaw) = appDomain
 
-              when (bstrAppBase == nullPtr) $
-                error "SysAllocString failed for ApplicationBase"
+        appBasePath <- newCWString "C:\\"
+        bstrAppBase <- c_SysAllocString (castPtr appBasePath)
+        free appBasePath
 
-              pPutApplicationBaseFuncPtr <- pPutApplicationBase domainVtablePtr'
-              hrPutAppBase <- mkADPutApplicationBase pPutApplicationBaseFuncPtr pAppDomain bstrAppBase
-              c_SysFreeString bstrAppBase
-              when (hrPutAppBase < 0) $ do
-                err <- c_GetLastError
-                error $ "_AppDomain::put_ApplicationBase failed: " ++ show hrPutAppBase ++ " (last error: " ++ show err ++ ")"
-              putStrLn "[*] AppDomain ApplicationBase set to C:\\."
-              hFlush stdout
+        when (bstrAppBase == nullPtr) $
+          error "SysAllocString failed for ApplicationBase"
 
-              -- Call _CorExeMain
-              putStrLn "[*] Calling _CorExeMain..."
-              hFlush stdout
-              -- Note: _CorExeMain on a manually mapped image might behave unexpectedly compared to OS load
-              rc <- c_CorExeMain imageBase
-              putStrLn $ "[*] _CorExeMain returned: " ++ show rc
-              hFlush stdout
+        pPutApplicationBaseFuncPtr <- pPutApplicationBase (castPtr domainVtablePtrRaw)
+        hrPutAppBase <- mkADPutApplicationBase pPutApplicationBaseFuncPtr (castPtr appDomainRaw) bstrAppBase
+        c_SysFreeString bstrAppBase
+        when (hrPutAppBase < 0) $ do
+          err <- c_GetLastError
+          error $ "_AppDomain::put_ApplicationBase failed: " ++ show hrPutAppBase ++ " (last error: " ++ show err ++ ")"
+        putStrLn "[*] AppDomain ApplicationBase set to C:\\."
+        hFlush stdout
 
-              -- Release AppDomain
-              pRelease_ADFuncPtr <- pRelease_AD domainVtablePtr'
-              _ <- mkADRelease pRelease_ADFuncPtr pAppDomain
-              putStrLn "[*] AppDomain released."
-              hFlush stdout
+        putStrLn "[*] Calling _CorExeMain..."
+        hFlush stdout
+        rc <- c_CorExeMain imageBase
+        putStrLn $ "[*] _CorExeMain returned: " ++ show rc
+        hFlush stdout
 
-            -- Stop the CLR
-            pStopFuncPtr <- pStop vtablePtr'
-            hrStop <- mkCLRStop pStopFuncPtr pRuntimeHost
-            when (hrStop < 0) $ do
-              err <- c_GetLastError
-              error $ "ICLRRuntimeHost::Stop failed: " ++ show hrStop ++ " (last error: " ++ show err ++ ")"
-            putStrLn "[*] CLR stopped."
-            hFlush stdout
+        pRelease_ADFuncPtr <- pRelease_AD (castPtr domainVtablePtrRaw)
+        _ <- mkADRelease pRelease_ADFuncPtr (castPtr appDomainRaw)
+        putStrLn "[*] AppDomain released."
+        hFlush stdout
 
-            -- Release ICLRRuntimeHost
-            pReleaseFuncPtr <- pRelease vtablePtr'
-            _ <- mkCLRRelease pReleaseFuncPtr pRuntimeHost
-            putStrLn "[*] ICLRRuntimeHost released."
-            hFlush stdout
+      pStopFuncPtr <- pStop (castPtr vtablePtrRaw)
+      hrStop <- mkCLRStop pStopFuncPtr (castPtr runtimeHostRaw)
+      when (hrStop < 0) $ do
+        err <- c_GetLastError
+        error $ "ICLRRuntimeHost::Stop failed: " ++ show hrStop ++ " (last error: " ++ show err ++ ")"
+      putStrLn "[*] CLR stopped."
+      hFlush stdout
 
-      -- Uninitialize COM
+      pReleaseFuncPtr <- pRelease (castPtr vtablePtrRaw)
+      _ <- mkCLRRelease pReleaseFuncPtr (castPtr runtimeHostRaw)
+      putStrLn "[*] ICLRRuntimeHost released."
+      hFlush stdout
+
       c_CoUninitialize
       putStrLn "[*] COM uninitialized."
       hFlush stdout
