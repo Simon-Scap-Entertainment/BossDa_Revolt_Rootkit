@@ -835,57 +835,41 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       _ <- c_CoInitializeEx nullPtr 0 
       putStrLn "[*] COM initialized."
       
-      -- 1. Get the Maybe wrapper
       maybeHost <- getCLRRuntimeHost
       case maybeHost of
-        Nothing -> error "[-] Critical Error: ICLRRuntimeHost instance is NULL."
-        Just pRuntimeHostRaw -> do
-          -- 1. runtimeHostRaw is now in scope for the rest of this 'do' block
-          let runtimeHostRaw = castPtr pRuntimeHostRaw
+        Nothing -> error "[-] Critical Error: ICLRRuntimeHost is NULL."
+        Just pRaw -> do
+          let instancePtr = castPtr pRaw
           
-          -- 2. DEREFERENCE the instance to get the VTable address
-          -- This fixes the Access Violation at 0x0
-          vtablePtr <- peek (castPtr runtimeHostRaw) :: IO (Ptr (Ptr ()))
+          -- 1. Get the VTable address
+          vtableAddr <- peek (castPtr instancePtr) :: IO (Ptr (Ptr ()))
           
-          if vtablePtr == nullPtr
-            then error "[-] VTable dereference failed!"
-            else do
-              -- 3. Get 'Start' (Index 3)
-              pStartFuncPtr <- peekElemOff (castPtr vtablePtr) 3
-              
-              if pStartFuncPtr == nullFunPtr
-                then error "[-] pStartFuncPtr is NULL."
-                else do
-                  putStrLn "[*] Calling ICLRRuntimeHost::Start..."
-                  hrStart <- mkCLRStart pStartFuncPtr runtimeHostRaw
-                  
-                  if hrStart < 0 
-                    then error $ "CLR Start failed: " ++ show hrStart
-                    else putStrLn "[*] CLR started successfully."
+          -- 2. Extract and CAST the Start function (Index 3)
+          pStartRaw <- peekElemOff vtableAddr 3
+          let pStartFuncPtr = castPtrToFunPtr pStartRaw
+          
+          -- 3. Call Start (Now the types match: FunPtr vs Ptr)
+          hrStart <- mkCLRStart pStartFuncPtr instancePtr
+          
+          if hrStart < 0 
+            then error "CLR Start failed"
+            else putStrLn "[+] CLR Started."
 
-              -- 4. Get AppDomain (Uses vtablePtr and runtimeHostRaw which are in scope)
-              alloca $ \ppvDomain -> do
-                pGetDefaultDomainFuncPtr <- pGetDefaultDomain (castPtr vtablePtr)
-                hrGetDomain <- mkCLRGetDefaultDomain pGetDefaultDomainFuncPtr runtimeHostRaw ppvDomain
-                
-                when (hrGetDomain < 0) $ error "Failed to get AppDomain"
-                
-                pAppDomainIUnknown <- peek ppvDomain
-                let appDomainRaw = castPtr pAppDomainIUnknown
-                domainVtablePtr <- peek (castPtr appDomainRaw) :: IO (Ptr (Ptr ()))
-
-                appBasePath <- newCWString "C:\\"
-                bstrAppBase <- c_SysAllocString (castPtr appBasePath)
-                pPutAppBaseFunc <- pPutApplicationBase (castPtr domainVtablePtr)
-                _ <- mkADPutApplicationBase pPutAppBaseFunc (castPtr appDomainRaw) bstrAppBase
-                
-                putStrLn "[*] Calling _CorExeMain..."
-                hFlush stdout
-                _ <- c_CorExeMain imageBase
-                
-                c_SysFreeString bstrAppBase
-                free appBasePath
-                return ()
+          -- 4. AppDomain Logic
+          alloca $ \ppvDomain -> do
+            -- Extract and CAST GetDefaultDomain (Index 13)
+            pGetDomainRaw <- peekElemOff vtableAddr 13
+            let pGetDomainFunc = castPtrToFunPtr pGetDomainRaw
+            
+            _ <- mkCLRGetDefaultDomain pGetDomainFunc instancePtr ppvDomain
+            
+            pAppDomain <- peek ppvDomain
+            let appDomainRaw = castPtr pAppDomain
+            
+            -- Call the entry point
+            putStrLn "[*] Calling _CorExeMain..."
+            _ <- c_CorExeMain imageBase
+            return ()
     else do
       -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
