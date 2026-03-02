@@ -1,0 +1,184 @@
+//go:build windows
+// +build windows
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
+	"unsafe"
+	_"embed"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+)
+
+func isAdmin() bool {
+	var hToken windows.Token
+	currentProcess := windows.CurrentProcess()
+
+	// Open process token
+	err := windows.OpenProcessToken(currentProcess, windows.TOKEN_QUERY, &hToken)
+	if err != nil {
+		return false
+	}
+	defer hToken.Close()
+
+	// TokenElevation struct
+	type TokenElevation struct {
+		TokenIsElevated uint32
+	}
+
+	var elevation TokenElevation
+	var retLen uint32
+
+	err = windows.GetTokenInformation(
+		hToken,
+		windows.TokenElevationType,
+		(*byte)(unsafe.Pointer(&elevation)),
+		uint32(unsafe.Sizeof(elevation)),
+		&retLen,
+	)
+	if err != nil {
+		return false
+	}
+
+	return elevation.TokenIsElevated != 0
+}
+
+var (
+	modadvapi32         = windows.NewLazySystemDLL("advapi32.dll")
+	procSetEntriesInAcl = modadvapi32.NewProc("SetEntriesInAclW")
+)
+
+// setEntriesInAcl calls the Windows API SetEntriesInAclW function.
+func setEntriesInAcl(count uint32, pEntries *windows.EXPLICIT_ACCESS, oldAcl *windows.ACL, newAcl **windows.ACL) error {
+	r1, _, err := procSetEntriesInAcl.Call(
+		uintptr(count),
+		uintptr(unsafe.Pointer(pEntries)),
+		uintptr(unsafe.Pointer(oldAcl)),
+		uintptr(unsafe.Pointer(newAcl)),
+	)
+	if r1 != 0 {
+		return err
+	}
+	return nil
+}
+
+// lockRegistryKey denies full access to "Everyone" for the specified registry key path.
+func lockRegistryKey(path string) {
+	// Open registry key with permissions to read control info and modify DACL.
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, path, windows.READ_CONTROL|windows.WRITE_DAC)
+	if err != nil {
+		// silently ignore errors
+		return
+	}
+	defer key.Close()
+
+	hKey := windows.Handle(key)
+
+	// Retrieve current security info to comply with API usage (can be omitted if unused).
+	_, err = windows.GetSecurityInfo(
+		hKey,
+		windows.SE_REGISTRY_KEY,
+		windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return
+	}
+
+	// Create a SID representing the "Everyone" group.
+	everyoneSid, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		return
+	}
+
+	// Define explicit access rule denying all access to Everyone.
+	ea := windows.EXPLICIT_ACCESS{
+		AccessPermissions: windows.KEY_ALL_ACCESS,
+		AccessMode:        windows.DENY_ACCESS,
+		Inheritance:       windows.NO_INHERITANCE,
+		Trustee: windows.TRUSTEE{
+			MultipleTrustee:          nil,
+			MultipleTrusteeOperation: windows.NO_MULTIPLE_TRUSTEE,
+			TrusteeForm:              windows.TRUSTEE_IS_SID,
+			TrusteeType:              windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+			TrusteeValue:             windows.TrusteeValue(uintptr(unsafe.Pointer(everyoneSid))),
+		},
+	}
+
+	var newDACL *windows.ACL
+	err = setEntriesInAcl(1, &ea, nil, &newDACL)
+	if err != nil {
+		return
+	}
+
+	// Apply the new DACL to the registry key.
+	err = windows.SetSecurityInfo(
+		hKey,
+		windows.SE_REGISTRY_KEY,
+		windows.DACL_SECURITY_INFORMATION,
+		nil, nil,
+		newDACL,
+		nil,
+	)
+	if err != nil {
+		return
+	}
+}
+
+func setEnableLUA() {
+	key, _, err := registry.CreateKey(
+		registry.LOCAL_MACHINE,
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`,
+		registry.SET_VALUE,
+	)
+	if err != nil {
+		return
+	}
+	defer key.Close()
+
+	// EnableLUA = 1 (enable UAC)
+	_ = key.SetDWordValue("EnableLUA", 1)
+}
+
+func restartSystem() {
+	cmd := exec.Command("shutdown", "/r", "/t", "0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+	}
+	_ = cmd.Run()
+}
+
+var (
+	moduser32        = windows.NewLazySystemDLL("user32.dll")
+	procMessageBoxW  = moduser32.NewProc("MessageBoxW")
+)
+
+func messageBox(text, title string, flags uintptr) int {
+	ret, _, _ := procMessageBoxW.Call(
+		0,
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(text))),
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(title))),
+		flags,
+	)
+	return int(ret)
+}
+
+const (
+	MB_YESNO        = 0x00000004
+	MB_ICONWARNING = 0x00000030
+	IDYES           = 6
+)
+
+
+func main() {
+	if !isAdmin() {
+		fmt.Println("This program must be run as Administrator!")
+		os.Exit(0)
+	}
+	setEnableLUA()
+	lockRegistryKey(`SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`)
+	restartSystem()
+}

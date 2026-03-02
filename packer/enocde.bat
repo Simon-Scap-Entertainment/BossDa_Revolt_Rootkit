@@ -1,0 +1,1 @@
+python encoder.py --xor-key comp340659 AntiForkieToolExtended.exe payload.bin
